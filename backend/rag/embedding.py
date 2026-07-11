@@ -1,6 +1,6 @@
 """共享 Embedding 工具
 
-使用 BGE-large-zh-v1.5 中文 Embedding 模型生成真实语义向量（1024 维）。
+使用 BGE-small-zh-v1.5 中文 Embedding 模型生成真实语义向量（512 维）。
 生产环境可替换为其他 BGE 系列模型或领域微调模型。
 """
 from __future__ import annotations
@@ -28,7 +28,7 @@ def _get_embedding_model():
             from sentence_transformers import SentenceTransformer
             logger.info("正在加载 BGE Embedding 模型...")
             _EMBEDDING_MODEL = SentenceTransformer(
-                'BAAI/bge-large-zh-v1.5',
+                'BAAI/bge-small-zh-v1.5',
                 device='cpu',
             )
             dim = _EMBEDDING_MODEL.get_embedding_dimension()
@@ -48,9 +48,9 @@ def _encode(text: str) -> tuple[float, ...]:
 
 
 async def dummy_embed(text: str) -> list[float]:
-    """BGE-large-zh-v1.5 Embedding
+    """BGE-small-zh-v1.5 Embedding
 
-    生成真实语义向量，1024 维，L2 归一化。
+    生成真实语义向量，512 维，L2 归一化。
     用 named dummy_embed 保持与现有代码兼容。
     """
     return list(_encode(text))

@@ -84,7 +84,7 @@ class MilvusIndexConfig:
 class MilvusConfig:
     uri: str = "http://localhost:19530"
     use_milvus: bool = False
-    embedding_dim: int = 1024
+    embedding_dim: int = 512
     collections: MilvusCollectionsConfig = field(default_factory=MilvusCollectionsConfig)
     index: MilvusIndexConfig = field(default_factory=MilvusIndexConfig)
 
@@ -99,6 +99,8 @@ class RetrievalConfig:
     retrieval_only_rerank_top_k: int = 3
     rrf_k: int = 60
     over_retrieval_multiplier: int = 2
+    consensus_retrieval_top_k: int = 8
+    consensus_rerank_top_k: int = 4
 
 
 @dataclass

@@ -2,7 +2,8 @@
 
 设计文档 3.3 节 + 3.4 节: 多专家会诊层
 - 根据 LLM 路由返回的 departments，动态实例化对应专科的 ReactEngine
-- 共识引导检索: 给各专科 Expert 注入患者画像，要求主动构建专业检索词
+- 共识引导检索: ① 给各专科 Expert 注入患者画像，要求主动构建专业检索词；
+  ② 共识提炼后用共识文本回检知识库，经 HybridRetriever→Reranker→LLM 验证
 - 反思拦截: 执行前检索 Reflection_Mem，高相似度命中则强插 Hint
 - 并发会诊: asyncio.gather 并发执行多专家 ReAct 循环
 - 共识提炼: 收集多专家结果，调用 LLM 提炼最终会诊报告
@@ -17,7 +18,7 @@ import logging
 
 from schema.models import MedicalQuery, MedicalResponse, PatientProfile
 from llm.client import AsyncLLMClient
-from llm.prompt_templates import EXPERT_SYSTEM_PROMPT, CONSENSUS_PROMPT, SAFE_FALLBACK_RESPONSE
+from llm.prompt_templates import EXPERT_SYSTEM_PROMPT, CONSENSUS_PROMPT, CONSENSUS_VERIFICATION_PROMPT, SAFE_FALLBACK_RESPONSE
 from engine.react_engine import ReactEngine
 from engine.tool_registry import global_tool_registry
 from memory.reflection_manager import ReflectionManager, InsufficientInformationException
@@ -33,7 +34,7 @@ class MDTConsultationWorkflow:
     """多专家 MDT 异步编排
 
     核心流程:
-    1. 反思拦截 → 2. 并发会诊 → 3. 共识提炼 → 4. 检索质量检查
+    1. 反思拦截 → 2. 并发会诊 → 3. 共识提炼 → 4. 共识引导检索（检索→重排→验证） → 5. 返回有证据支撑的最终报告
     """
 
     def __init__(
@@ -133,11 +134,55 @@ class MDTConsultationWorkflow:
             messages=[Message(role="user", content=consensus_prompt)],
             temperature=cfg.llm.temperatures["consensus"],
         )
+        consensus_text = consensus_resp.content or "会诊未能得出结论"
+
+        # 6. 共识引导检索: 用共识摘要检索知识库，验证共识主张
+        sources: list[str] = []
+        try:
+            consensus_docs = await self.retriever.retrieve(
+                consensus_text,
+                profile=self.profile,
+                top_k=cfg.retrieval.consensus_retrieval_top_k,
+            )
+            if consensus_docs:
+                reranked = await self.reranker.rerank(
+                    consensus_text,
+                    consensus_docs,
+                    top_k=cfg.retrieval.consensus_rerank_top_k,
+                )
+                if reranked:
+                    evidence_lines = []
+                    for doc in reranked:
+                        evidence_lines.append(f"[{evidence_lines.__len__() + 1}] {doc.content}")
+                        if doc.source:
+                            sources.append(doc.source)
+                    evidence_text = "\n".join(evidence_lines)
+                    profile_text_v = ""
+                    if self.profile:
+                        profile_text_v = f"疾病={self.profile.diseases}, 用药={self.profile.medications}, 过敏={self.profile.allergies}"
+                    verify_prompt = CONSENSUS_VERIFICATION_PROMPT.format(
+                        consensus=consensus_text,
+                        evidence=evidence_text,
+                        profile=profile_text_v or "无",
+                    )
+                    verified_resp = await self.llm.chat(
+                        messages=[Message(role="user", content=verify_prompt)],
+                        temperature=cfg.llm.temperatures["consensus"],
+                    )
+                    final_answer = verified_resp.content or consensus_text
+                else:
+                    final_answer = consensus_text
+            else:
+                final_answer = consensus_text
+        except Exception as e:
+            logger.warning(f"共识引导检索失败: {e}")
+            final_answer = consensus_text
 
         response = MedicalResponse(
-            answer=consensus_resp.content or "会诊未能得出结论",
+            answer=final_answer,
             route_path="mdt",
             departments=departments,
+            sources=sources,
         )
 
         logger.info("MDT 会诊完成")
