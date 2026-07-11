@@ -93,6 +93,22 @@ async def lifespan(app: FastAPI):
             milvus.init_all_collections()
             milvus_connected = True
             logger.info("Milvus 连接成功")
+
+            # 自动注入种子知识库（首次启动时 Milvus 为空）
+            try:
+                existing = milvus.search(
+                    collection_name=cfg.milvus.collections.kb,
+                    vector=[0.0] * cfg.milvus.embedding_dim,
+                    limit=1,
+                )
+                if not existing:
+                    logger.info("Milvus 知识库为空，自动注入种子数据...")
+                    from seed_data import seed_milvus
+                    await seed_milvus(milvus)
+                    logger.info("种子数据注入完成")
+            except Exception as e:
+                logger.warning(f"种子数据注入检查失败: {e}")
+
         except Exception as e:
             logger.warning(f"Milvus 连接失败: {e}")
             milvus = None
@@ -106,7 +122,6 @@ async def lifespan(app: FastAPI):
     # ---- 检索与重排 ----
     retriever = HybridRetriever(milvus)
     reranker = MedicalReranker(
-        llm_client=llm,
         low_threshold=cfg.reranker.low_threshold,
     )
     set_retriever(retriever, reranker)

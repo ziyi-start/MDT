@@ -3,10 +3,10 @@
 设计文档四大核心层的闭环实现:
 1. 交互与动态路由层: 规则拦截 → LLM路由 → 置信度评估 → 携因打回升级
 2. 多专家会诊层: 反思拦截 → 并发会诊 → 共识提炼
-3. 记忆与检索协同层: 画像更新 → 混合检索 → 重排 → CoT退避
+3. 记忆与检索协同层: 画像更新 → 混合检索 → 共识引导检索 → 重排 → CoT退避
 4. 反思与决策层: Decision Maker → 归因反思 → 安全退避
 
-完整闭环: 查询 → 画像更新 → 路由 → 执行 → 评估 → (升级/退避/输出)
+完整闭环: 查询 → 画像更新 → 路由 → 执行 → 共识引导检索 → 评估 → (升级/退避/输出)
 """
 from __future__ import annotations
 
@@ -92,8 +92,9 @@ class MedicalOrchestrator:
     3. 闭环动态路由（规则拦截 → LLM路由）
     4. 执行工作流（Simple RAG / MDT）
     5. 置信度评估（Simple RAG 末尾，可能升级到 MDT）
-    6. Decision Maker 评估（MDT 末尾，可能触发反思/退避）
-    7. 失败处理（反思沉淀 / CoT退避 / 携因打回）
+    6. 共识引导检索（MDT 内部：共识摘要 → Hybrid检索 → Reranker → LLM验证）
+    7. Decision Maker 评估（MDT 末尾，基于证据验证后的共识，可能触发反思/退避）
+    8. 失败处理（反思沉淀 / CoT退避 / 携因打回）
     """
 
     def __init__(
@@ -149,7 +150,7 @@ class MedicalOrchestrator:
             quick_docs = await self.retriever.retrieve(query.query, profile=profile, top_k=cfg.retrieval.quick_check_top_k)
             if not quick_docs:
                 logger.warning("CoT 安全退避: 检索结果为空")
-                await self._store_reflection(query.query, "检索结果为空，知识库无相关知识")
+                # 检索为空说明知识库无相关知识，不存储无意义的反思三元组
                 return MedicalResponse(
                     answer=SAFE_FALLBACK_RESPONSE,
                     route_path="safe_fallback",
@@ -237,13 +238,13 @@ class MedicalOrchestrator:
         departments: list[str],
         escalation_reason: str = "",
     ):
-        """执行 MDT 会诊 + Decision Maker 评估"""
+        """执行 MDT 会诊（含共识引导检索）+ Decision Maker 评估"""
         workflow = MDTConsultationWorkflow(
             self.llm, self.reflection, self.retriever, self.reranker, profile
         )
         response = await workflow.run(query, departments, escalation_reason)
 
-        # ---- Decision Maker 安全阀评估 ----
+        # ---- Decision Maker 安全阀评估（基于证据验证后的共识） ----
         try:
             evaluation = await self.decision_maker.evaluate(response.answer, profile)
 

@@ -202,6 +202,17 @@
         }
         .status-dot.ok { background: var(--success); }
         .status-dot.err { background: var(--danger); }
+        .docs-link {
+            color: rgba(255,255,255,.8);
+            text-decoration: none;
+            font-size: 13px;
+            margin-left: auto;
+            padding: 4px 12px;
+            border: 1px solid rgba(255,255,255,.3);
+            border-radius: 8px;
+            transition: all .2s;
+        }
+        .docs-link:hover { background: rgba(255,255,255,.15); color: #fff; }
     </style>
 </head>
 <body>
@@ -212,6 +223,7 @@
                 <h1>医疗多智能体协同 RAG 系统</h1>
                 <p>闭环动态路由 | 渐进式画像约束检索 | 归因式反思沉淀 | CoT 安全退避</p>
             </div>
+            <a href="/docs" class="docs-link" target="_blank">API Docs</a>
         </div>
     </div>
 

@@ -26,7 +26,7 @@ llm:
 milvus:
   uri: "http://localhost:19530"            # Milvus 连接地址
   use_milvus: true                         # 是否启用 Milvus（true 时连接 Milvus，false 时使用内存模式）
-  embedding_dim: 1024                      # 向量维度（BGE-large）
+  embedding_dim: 512                       # 向量维度（BGE-small）
   collections:
     kb: "Medical_KB"                       # 医学知识库集合名
     profile: "Patient_Profile"             # 患者画像集合名
@@ -47,6 +47,8 @@ retrieval:
   retrieval_only_rerank_top_k: 3           # 纯检索模式重排后数量
   rrf_k: 60                                # RRF 融合参数（标准值 60）
   over_retrieval_multiplier: 2             # 检索过采样倍数（先取 top_k * N 再过滤）
+  consensus_retrieval_top_k: 8             # 共识引导检索返回文档数
+  consensus_rerank_top_k: 4                # 共识引导检索重排后保留文档数
 
 # ---- 重排参数 ----
 reranker:
@@ -73,7 +75,7 @@ react:
 
 # ---- 反思记忆 ----
 reflection:
-  search_threshold: 0.8                    # 反思检索相似度阈值
+  search_threshold: 0.5                    # 反思检索相似度阈值
   max_in_memory: 100                       # 内存反思存储上限
   in_memory_overlap_ratio: 0.3             # 内存模式关键词重叠度阈值
   in_memory_min_terms: 2                   # 内存模式最小重叠词数
@@ -88,7 +90,7 @@ services:
 server:
   host: "0.0.0.0"
   port: 8000
-  reload: true                             # 开发模式自动重载
+  reload: false                            # 开发模式自动重载（设为 true 时日志文件需排除在监控外）
   app_version: "1.0.0"
 
 # ---- 通用 ----

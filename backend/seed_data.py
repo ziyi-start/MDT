@@ -4,9 +4,16 @@
   MDT_USE_MILVUS=true python seed_data.py
 
 前置条件: Milvus 服务已启动 (docker-compose up -d)
+
+向量预计算说明:
+  seed_vectors.json 由 precompute_vectors.py 提前生成，
+  包含 SEED_KB 中每条知识预计算的 BGE-small 向量（512 维），
+  避免启动时加载 embedding 模型。
+  如需重新生成：python scripts/precompute_vectors.py
 """
 from __future__ import annotations
 
+import json
 import asyncio
 import logging
 import sys
@@ -16,7 +23,6 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from config import cfg
 from rag.milvus_client import MilvusManager
-from rag.embedding import dummy_embed
 
 logger = logging.getLogger(__name__)
 
@@ -82,7 +88,7 @@ SEED_KB = [
 
 
 async def seed_data():
-    """向 Milvus 注入种子数据"""
+    """向 Milvus 注入种子数据（独立运行模式）"""
     milvus_uri = os.getenv("MDT_MILVUS_URI", cfg.milvus.uri)
 
     logger.info(f"连接 Milvus: {milvus_uri}")
@@ -90,21 +96,38 @@ async def seed_data():
     milvus.connect()
     milvus.init_all_collections()
 
-    # 注入知识库
+    await seed_milvus(milvus)
+
+
+async def seed_milvus(milvus: MilvusManager):
+    """向 Milvus 注入种子数据（使用预计算向量，不加载 embedding 模型）"""
     logger.info(f"注入 {len(SEED_KB)} 条医学知识...")
+
+    vectors_path = os.path.join(os.path.dirname(__file__), "seed_vectors.json")
+    if not os.path.exists(vectors_path):
+        logger.error(f"预计算向量文件不存在: {vectors_path}")
+        logger.error("请先运行 scripts/precompute_vectors.py 生成 seed_vectors.json")
+        return
+
+    with open(vectors_path, "r", encoding="utf-8") as f:
+        vectors = json.load(f)
+
     data = []
     for doc in SEED_KB:
-        vec = await dummy_embed(doc["content"])
+        vec_data = vectors.get(doc["doc_id"])
+        if vec_data is None:
+            logger.error(f"缺少预计算向量: {doc['doc_id']}")
+            continue
         data.append({
             "doc_id": doc["doc_id"],
-            "embedding": vec,
+            "embedding": vec_data["embedding"],
             "content": doc["content"],
             "source": doc["source"],
             "department": doc["department"],
             "contraindications": doc["contraindications"],
         })
 
-    milvus.upsert(cfg.milvus.collections.kb, data)
+    milvus.insert(cfg.milvus.collections.kb, data)
     logger.info(f"成功注入 {len(data)} 条知识库数据")
     logger.info("种子数据注入完成！")
 

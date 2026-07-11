@@ -73,23 +73,55 @@ class ConfidenceChecker:
     def _detect_conclusion_conflict(self, content1: str, content2: str) -> bool:
         """检测两篇文档是否存在结论冲突
 
-        启发式检测: 一篇推荐某药物/方案，另一篇明确禁忌/不推荐同一药物/方案
+        启发式检测: 针对同一药物/方案，一篇推荐另一篇禁忌。
+        要求两篇文档提到相同的核心药物/方案关键词才判定冲突。
         """
+        import re
+
+        # 提取两篇文档中提到的药物关键词
+        drug_pattern = re.compile(
+            r"(布洛芬|阿司匹林|氯吡格雷|秋水仙碱|对乙酰氨基酚|甲氨蝶呤|别嘌醇|"
+            r"二甲双胍|硝苯地平|阿莫西林|头孢|奥美拉唑|泼尼松|塞来昔布|NSAIDs)"
+        )
+        drugs1 = set(drug_pattern.findall(content1))
+        drugs2 = set(drug_pattern.findall(content2))
+        common_drugs = drugs1 & drugs2
+
+        # 没有共同药物关键词，不算冲突（只是讨论不同药物）
+        if not common_drugs:
+            return False
+
         # 禁忌/不推荐关键词
         negation_phrases = ["禁用", "禁忌", "不推荐", "避免使用", "不可使用", "不建议", "不应使用"]
         # 推荐/可用关键词
         positive_phrases = ["推荐", "首选", "可用", "安全", "可以使用", "一线用药"]
 
-        has_negation_1 = any(p in content1 for p in negation_phrases)
-        has_negation_2 = any(p in content2 for p in negation_phrases)
-        has_positive_1 = any(p in content1 for p in positive_phrases)
-        has_positive_2 = any(p in content2 for p in positive_phrases)
+        # 针对共同药物，检查是否在推荐/禁忌立场上相反
+        for drug in common_drugs:
+            # 找到药物在文档中出现位置附近的立场
+            doc1_has_neg = any(f"{drug}" in p or drug in p for p in negation_phrases) or \
+                           self._has_nearby_keyword(content1, drug, negation_phrases)
+            doc1_has_pos = any(f"{drug}" in p or drug in p for p in positive_phrases) or \
+                           self._has_nearby_keyword(content1, drug, positive_phrases)
+            doc2_has_neg = any(f"{drug}" in p or drug in p for p in negation_phrases) or \
+                           self._has_nearby_keyword(content2, drug, negation_phrases)
+            doc2_has_pos = any(f"{drug}" in p or drug in p for p in positive_phrases) or \
+                           self._has_nearby_keyword(content2, drug, positive_phrases)
 
-        # 一篇推荐，一篇禁忌 → 冲突
-        if (has_positive_1 and has_negation_2) or (has_positive_2 and has_negation_1):
-            return True
+            # 同一药物，一篇推荐一篇禁忌 → 冲突
+            if (doc1_has_pos and doc2_has_neg) or (doc2_has_pos and doc1_has_neg):
+                return True
 
         return False
+
+    @staticmethod
+    def _has_nearby_keyword(text: str, anchor: str, keywords: list[str], window: int = 50) -> bool:
+        """检查文本中 anchor 关键词附近是否存在指定关键词"""
+        idx = text.find(anchor)
+        if idx == -1:
+            return False
+        nearby = text[max(0, idx - window):idx + len(anchor) + window]
+        return any(kw in nearby for kw in keywords)
 
     async def check_generation_confidence(self, answer: str, documents: list[DocumentChunk]) -> tuple[bool, str]:
         """生成自验证

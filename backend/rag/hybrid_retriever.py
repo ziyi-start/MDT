@@ -75,12 +75,12 @@ class HybridRetriever:
     @staticmethod
     def _sanitize_filter_value(value: str) -> str:
         """转义 Milvus filter 表达式中的特殊字符，防止注入"""
-        return value.replace('"', '').replace('%', '').replace("'", "")
+        return value.replace('"', '').replace("'", "").replace("%", "").replace("\\", "")
 
     async def _hybrid_search_milvus(
         self, query: str, profile: PatientProfile | None, limit: int
     ) -> list[DocumentChunk]:
-        """Milvus 混合检索: Dense + BM25 + RRF 融合"""
+        """Milvus 混合检索: Dense + BM25 (hybrid_search) + RRF 融合"""
         # 硬约束: 构建 Milvus 过滤表达式
         filter_expr = ""
         contraindications = profile.get_contraindications() if profile else []
@@ -93,47 +93,31 @@ class HybridRetriever:
             filter_expr = " and ".join(conditions)
             logger.info(f"Milvus 硬约束 filter: {filter_expr}")
 
-        # Dense 检索
+        # Dense + BM25 混合检索（Milvus 原生 hybrid_search + RRF）
         query_vec = await dummy_embed(query)
-        dense_results = []
+        results = []
         try:
-            dense_results = self.milvus.search(
+            results = self.milvus.hybrid_search(
                 collection_name=cfg.milvus.collections.kb,
-                vector=query_vec,
+                dense_vector=query_vec,
+                query_text=query,
                 limit=limit,
                 filter_expr=filter_expr,
             )
         except Exception as e:
-            logger.warning(f"Milvus Dense 检索失败: {e}")
+            logger.warning(f"Milvus hybrid_search 失败，降级为 Dense 检索: {e}")
+            try:
+                dense_results = self.milvus.search(
+                    collection_name=cfg.milvus.collections.kb,
+                    vector=query_vec,
+                    limit=limit,
+                    filter_expr=filter_expr,
+                )
+                results = dense_results
+            except Exception as e2:
+                logger.warning(f"Milvus Dense 检索也失败: {e2}")
 
-        # BM25 稀疏检索
-        bm25_results = []
-        try:
-            bm25_results = self.milvus.search_bm25(
-                collection_name=cfg.milvus.collections.kb,
-                query=query,
-                limit=limit,
-                filter_expr=filter_expr,
-            )
-        except Exception as e:
-            logger.warning(f"Milvus BM25 检索失败: {e}")
-
-        # BM25 不可用时，用关键词匹配模拟 BM25 排名
-        if not bm25_results and dense_results:
-            bm25_results = self._keyword_rerank_as_bm25(query, dense_results, limit)
-
-        # 如果两路都没有结果
-        if not dense_results and not bm25_results:
-            return []
-
-        # 只有一路结果时，直接返回
-        if not bm25_results:
-            return self._milvus_results_to_chunks(dense_results)
-        if not dense_results:
-            return self._milvus_results_to_chunks(bm25_results)
-
-        # RRF 融合: 手写 Reciprocal Rank Fusion
-        return self._rrf_fusion(dense_results, bm25_results, limit)
+        return self._milvus_results_to_chunks(results)
 
     def _keyword_rerank_as_bm25(
         self, query: str, dense_results: list[dict], limit: int
