@@ -6,7 +6,7 @@
 
 # 🏥 医疗垂直领域多智能体协同 RAG 系统技术设计文档
 
-**项目周期**：2026 年5月 - 至今
+**项目周期**：2026 年 5 月 - 至今
 **文档版本**：v1.0
 **核心技术栈**：LLM, SFT, Multi-Agent (ReAct), Milvus, Hybrid RAG, CoT, vLLM, Python
 
