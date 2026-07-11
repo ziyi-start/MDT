@@ -1,0 +1,95 @@
+# ============================================================
+# MDT 医疗多智能体协同 RAG 系统 - 配置文件
+# ============================================================
+# 优先级: 环境变量 > config/custom.yaml > config/default.yaml
+# 使用方式: 复制本文件为 custom.yaml 并按需修改
+# ============================================================
+
+# ---- LLM 配置 ----
+llm:
+  base_url: "https://api.deepseek.com"    # OpenAI 兼容 API 地址
+  api_key: ""                                                                   # API 密钥，必须通过环境变量 MDT_LLM_API_KEY 设置
+  model: "deepseek-chat"                   # 模型名称
+  temperature: 0.3                         # 默认生成温度
+  max_tokens: 2048                         # 默认最大生成 token 数
+  # 以下为各模块的专用温度（低温度保证确定性输出）
+  temperatures:
+    router: 0.1                            # LLM 路由
+    reranker: 0.1                          # LLM 重排
+    confidence_check: 0.1                  # 置信度校验
+    reflection: 0.1                        # 反思生成
+    profile_extraction: 0.1                # 画像抽取
+    decision_maker: 0.1                    # 决策器
+    consensus: 0.3                         # 共识提炼
+
+# ---- Milvus 向量数据库 ----
+milvus:
+  uri: "http://localhost:19530"            # Milvus 连接地址
+  use_milvus: true                         # 是否启用 Milvus（true 时连接 Milvus，false 时使用内存模式）
+  embedding_dim: 1024                      # 向量维度（BGE-large）
+  collections:
+    kb: "Medical_KB"                       # 医学知识库集合名
+    profile: "Patient_Profile"             # 患者画像集合名
+    reflection: "Reflection_Mem"           # 反思记忆集合名
+  index:
+    type: "IVF_FLAT"                       # 索引类型
+    metric_type: "COSINE"                  # 度量类型
+    params:
+      nlist: 128                           # IVF 聚类数
+
+# ---- 检索参数 ----
+retrieval:
+  top_k: 10                                # 检索返回文档数量
+  rerank_top_k: 5                          # 重排后保留文档数量
+  quick_check_top_k: 3                     # CoT 预检查检索数量
+  literature_search_top_k: 5               # 文献检索工具返回数量
+  retrieval_only_top_k: 5                  # 纯检索模式返回数量
+  retrieval_only_rerank_top_k: 3           # 纯检索模式重排后数量
+  rrf_k: 60                                # RRF 融合参数（标准值 60）
+  over_retrieval_multiplier: 2             # 检索过采样倍数（先取 top_k * N 再过滤）
+
+# ---- 重排参数 ----
+reranker:
+  low_threshold: 0.2                       # CoT 退避阈值（Reranker 最高分低于此值触发安全退避）
+  llm_weight: 0.7                          # LLM 重排: LLM 评分权重
+  original_weight: 0.3                     # LLM 重排: 原始分数权重
+  ngram_weight: 0.5                        # n-gram 重排: n-gram 权重
+  ngram_original_weight: 0.5               # n-gram 重排: 原始分数权重
+  content_preview_length: 300              # LLM 重排时截取文档内容长度
+
+# ---- 置信度评估 ----
+confidence:
+  score_gap_threshold: 0.15                # 文档一致性校验分数差距阈值
+  min_confidence: 0.6                      # 生成自验证最低置信度阈值
+
+# ---- 决策器 ----
+decision_maker:
+  quality_threshold: 0.5                   # 质量分低于此值触发 CoT 安全退避
+  retrieval_only_confidence: 0.3           # 纯检索模式默认置信度
+
+# ---- ReAct 引擎 ----
+react:
+  max_iterations: 5                        # ReAct 循环最大迭代次数
+
+# ---- 反思记忆 ----
+reflection:
+  search_threshold: 0.8                    # 反思检索相似度阈值
+  max_in_memory: 100                       # 内存反思存储上限
+  in_memory_overlap_ratio: 0.3             # 内存模式关键词重叠度阈值
+  in_memory_min_terms: 2                   # 内存模式最小重叠词数
+
+# ---- 外部服务 ----
+services:
+  ner_url: ""                              # NER 服务地址（BERT-CRF）
+  rerank_api_url: ""                       # Reranker API 地址（BGE-Reranker）
+  ner_timeout: 5.0                         # NER 服务调用超时（秒）
+
+# ---- 服务器 ----
+server:
+  host: "0.0.0.0"
+  port: 8000
+  reload: true                             # 开发模式自动重载
+  app_version: "1.0.0"
+
+# ---- 通用 ----
+default_user_id: "default_user"            # 默认用户 ID

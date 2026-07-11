@@ -1,0 +1,371 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>医疗多智能体协同 RAG 系统</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        :root {
+            --primary: #2563eb;
+            --primary-light: #3b82f6;
+            --bg: #f8fafc;
+            --card: #ffffff;
+            --text: #1e293b;
+            --text-light: #64748b;
+            --border: #e2e8f0;
+            --success: #10b981;
+            --warning: #f59e0b;
+            --danger: #ef4444;
+            --safe: #6366f1;
+        }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+            background: var(--bg);
+            color: var(--text);
+            min-height: 100vh;
+        }
+        .header {
+            background: linear-gradient(135deg, var(--primary), #7c3aed);
+            color: white;
+            padding: 20px 0;
+            box-shadow: 0 4px 6px -1px rgba(0,0,0,.1);
+        }
+        .header-inner {
+            max-width: 900px;
+            margin: 0 auto;
+            padding: 0 24px;
+            display: flex;
+            align-items: center;
+            gap: 16px;
+        }
+        .header h1 { font-size: 22px; font-weight: 700; }
+        .header p { font-size: 13px; opacity: .85; margin-top: 2px; }
+        .logo {
+            width: 44px; height: 44px;
+            background: rgba(255,255,255,.2);
+            border-radius: 12px;
+            display: flex; align-items: center; justify-content: center;
+            font-size: 24px;
+        }
+        .container {
+            max-width: 900px;
+            margin: 0 auto;
+            padding: 24px;
+        }
+        .input-area {
+            background: var(--card);
+            border-radius: 16px;
+            padding: 24px;
+            box-shadow: 0 1px 3px rgba(0,0,0,.08);
+            margin-bottom: 20px;
+        }
+        .input-area label {
+            font-size: 14px;
+            font-weight: 600;
+            display: block;
+            margin-bottom: 8px;
+        }
+        .input-row {
+            display: flex;
+            gap: 12px;
+            align-items: flex-end;
+        }
+        .input-row textarea {
+            flex: 1;
+            border: 2px solid var(--border);
+            border-radius: 12px;
+            padding: 12px 16px;
+            font-size: 15px;
+            resize: none;
+            height: 56px;
+            outline: none;
+            transition: border-color .2s;
+            font-family: inherit;
+        }
+        .input-row textarea:focus { border-color: var(--primary); }
+        .btn-send {
+            background: var(--primary);
+            color: white;
+            border: none;
+            border-radius: 12px;
+            padding: 0 28px;
+            height: 56px;
+            font-size: 15px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: background .2s;
+            white-space: nowrap;
+        }
+        .btn-send:hover { background: var(--primary-light); }
+        .btn-send:disabled { opacity: .5; cursor: not-allowed; }
+
+        /* 示例问题 */
+        .examples {
+            margin-top: 14px;
+            display: flex;
+            flex-wrap: wrap;
+            gap: 8px;
+        }
+        .examples span { font-size: 12px; color: var(--text-light); margin-right: 4px; line-height: 28px; }
+        .example-btn {
+            background: #f1f5f9;
+            border: 1px solid var(--border);
+            border-radius: 20px;
+            padding: 4px 14px;
+            font-size: 12px;
+            cursor: pointer;
+            transition: all .2s;
+            color: var(--text);
+        }
+        .example-btn:hover { background: #e2e8f0; border-color: var(--primary); color: var(--primary); }
+
+        /* 消息区 */
+        .messages { display: flex; flex-direction: column; gap: 16px; }
+
+        .msg {
+            background: var(--card);
+            border-radius: 16px;
+            padding: 20px 24px;
+            box-shadow: 0 1px 3px rgba(0,0,0,.06);
+            animation: fadeIn .3s ease;
+        }
+        @keyframes fadeIn { from { opacity:0; transform:translateY(8px); } to { opacity:1; transform:none; } }
+
+        .msg-user { border-left: 4px solid var(--primary); }
+        .msg-system { border-left: 4px solid var(--success); }
+        .msg-safe { border-left: 4px solid var(--safe); }
+        .msg-error { border-left: 4px solid var(--danger); }
+
+        .msg-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 10px;
+        }
+        .msg-role {
+            font-size: 13px;
+            font-weight: 600;
+            color: var(--text-light);
+        }
+        .msg-meta {
+            display: flex;
+            gap: 8px;
+            align-items: center;
+        }
+        .badge {
+            font-size: 11px;
+            padding: 2px 10px;
+            border-radius: 20px;
+            font-weight: 600;
+        }
+        .badge-rag { background: #dbeafe; color: #1d4ed8; }
+        .badge-mdt { background: #fef3c7; color: #92400e; }
+        .badge-safe { background: #ede9fe; color: #5b21b6; }
+        .badge-error { background: #fee2e2; color: #991b1b; }
+        .badge-dept { background: #f1f5f9; color: #475569; }
+
+        .msg-body {
+            font-size: 14px;
+            line-height: 1.7;
+            white-space: pre-wrap;
+        }
+        .msg-body .source { color: var(--primary); font-size: 12px; }
+
+        .loading {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            color: var(--text-light);
+            font-size: 14px;
+            padding: 16px 0;
+        }
+        .loading .dots span {
+            animation: blink 1.4s infinite both;
+            font-size: 20px;
+        }
+        .loading .dots span:nth-child(2) { animation-delay: .2s; }
+        .loading .dots span:nth-child(3) { animation-delay: .4s; }
+        @keyframes blink { 0%,80%,100% { opacity:0; } 40% { opacity:1; } }
+
+        .status-bar {
+            margin-top: 16px;
+            text-align: center;
+            font-size: 12px;
+            color: var(--text-light);
+        }
+        .status-dot {
+            display: inline-block;
+            width: 8px; height: 8px;
+            border-radius: 50%;
+            margin-right: 6px;
+        }
+        .status-dot.ok { background: var(--success); }
+        .status-dot.err { background: var(--danger); }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <div class="header-inner">
+            <div class="logo">&#9764;</div>
+            <div>
+                <h1>医疗多智能体协同 RAG 系统</h1>
+                <p>闭环动态路由 | 渐进式画像约束检索 | 归因式反思沉淀 | CoT 安全退避</p>
+            </div>
+        </div>
+    </div>
+
+    <div class="container">
+        <div class="input-area">
+            <label>输入医疗咨询问题</label>
+            <div class="input-row">
+                <textarea id="queryInput" placeholder="例如：患者有高血压和胃溃疡，最近痛风发作，能吃布洛芬吗？"></textarea>
+                <button class="btn-send" id="sendBtn" onclick="sendQuery()">发送咨询</button>
+            </div>
+            <div class="examples">
+                <span>试试：</span>
+                <button class="example-btn" onclick="setQuery('布洛芬的用法用量是什么？')">布洛芬用法用量</button>
+                <button class="example-btn" onclick="setQuery('高血压和胃溃疡患者痛风发作，能吃布洛芬吗？')">高血压+胃溃疡+痛风</button>
+                <button class="example-btn" onclick="setQuery('糖尿病合并肾病患者如何选择止痛药？')">糖尿病+肾病止痛</button>
+                <button class="example-btn" onclick="setQuery('氯吡格雷和阿司匹林能同时吃吗？')">氯吡格雷+阿司匹林</button>
+            </div>
+        </div>
+
+        <div class="messages" id="messages"></div>
+
+        <div class="status-bar">
+            <span class="status-dot" id="statusDot"></span>
+            <span id="statusText">正在连接...</span>
+        </div>
+    </div>
+
+<script>
+const API_URL = '/api/query';
+const WS_URL = `ws://${location.host}/ws/query`;
+let userId = 'user_' + Math.random().toString(36).slice(2, 8);
+
+// 检查健康状态
+fetch('/api/health')
+    .then(r => r.json())
+    .then(d => {
+        document.getElementById('statusDot').className = 'status-dot ok';
+        document.getElementById('statusText').textContent = '系统就绪' + (d.milvus ? ' (Milvus 已连接)' : ' (内存模式)');
+    })
+    .catch(() => {
+        document.getElementById('statusDot').className = 'status-dot err';
+        document.getElementById('statusText').textContent = '系统连接失败';
+    });
+
+function setQuery(text) {
+    document.getElementById('queryInput').value = text;
+    document.getElementById('queryInput').focus();
+}
+
+document.getElementById('queryInput').addEventListener('keydown', e => {
+    if (e.key === 'Enter' && !e.shiftKey) {
+        e.preventDefault();
+        sendQuery();
+    }
+});
+
+async function sendQuery() {
+    const input = document.getElementById('queryInput');
+    const query = input.value.trim();
+    if (!query) return;
+
+    input.value = '';
+    const btn = document.getElementById('sendBtn');
+    btn.disabled = true;
+
+    // 用户消息
+    addMessage('user', query);
+
+    // Loading
+    const loadingEl = addLoading();
+
+    try {
+        const resp = await fetch(API_URL, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ query, user_id: userId }),
+        });
+        const data = await resp.json();
+        loadingEl.remove();
+
+        if (data.error) {
+            addMessage('error', data.error);
+        } else {
+            addMessage('system', data.answer, {
+                route_path: data.route_path,
+                departments: data.departments,
+                confidence: data.confidence,
+                is_safe_fallback: data.is_safe_fallback,
+                sources: data.sources,
+            });
+        }
+    } catch (err) {
+        loadingEl.remove();
+        addMessage('error', '请求失败: ' + err.message);
+    } finally {
+        btn.disabled = false;
+    }
+}
+
+function addMessage(role, text, meta = {}) {
+    const container = document.getElementById('messages');
+    const div = document.createElement('div');
+
+    let cls = 'msg';
+    if (role === 'user') cls += ' msg-user';
+    else if (meta.is_safe_fallback) cls += ' msg-safe';
+    else if (role === 'error') cls += ' msg-error';
+    else cls += ' msg-system';
+
+    // Badge
+    let badges = '';
+    if (meta.route_path === 'simple_rag') badges += '<span class="badge badge-rag">Simple RAG</span>';
+    else if (meta.route_path === 'mdt') badges += '<span class="badge badge-mdt">MDT 会诊</span>';
+    else if (meta.route_path === 'safe_fallback') badges += '<span class="badge badge-safe">安全退避</span>';
+    else if (meta.route_path === 'error') badges += '<span class="badge badge-error">异常</span>';
+
+    if (meta.departments && meta.departments.length > 0) {
+        meta.departments.forEach(d => { badges += `<span class="badge badge-dept">${d}</span>`; });
+    }
+
+    const roleText = role === 'user' ? '患者提问' : role === 'error' ? '系统异常' : '系统回答';
+    div.className = cls;
+    div.innerHTML = `
+        <div class="msg-header">
+            <span class="msg-role">${roleText}</span>
+            <div class="msg-meta">${badges}</div>
+        </div>
+        <div class="msg-body">${escapeHtml(text)}</div>
+    `;
+
+    container.appendChild(div);
+    div.scrollIntoView({ behavior: 'smooth' });
+    return div;
+}
+
+function addLoading() {
+    const container = document.getElementById('messages');
+    const div = document.createElement('div');
+    div.className = 'msg msg-system';
+    div.innerHTML = `
+        <div class="loading">
+            <span>系统正在分析处理</span>
+            <span class="dots"><span>.</span><span>.</span><span>.</span></span>
+        </div>
+    `;
+    container.appendChild(div);
+    div.scrollIntoView({ behavior: 'smooth' });
+    return div;
+}
+
+function escapeHtml(text) {
+    const map = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#039;' };
+    return text.replace(/[&<>"']/g, m => map[m]);
+}
+</script>
+</body>
+</html>
