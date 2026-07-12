@@ -10,9 +10,20 @@
 from __future__ import annotations
 
 import os
+import sys
+import io
 import logging
 from pathlib import Path
 from dataclasses import dataclass, field
+
+# 强制 UTF-8 输出，解决 Windows 控制台中文乱码
+if sys.stdout.encoding != "utf-8":
+    try:
+        sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
+        sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+os.environ.setdefault("PYTHONIOENCODING", "utf-8")
 
 import yaml
 from dotenv import load_dotenv

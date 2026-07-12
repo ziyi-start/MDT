@@ -27,6 +27,8 @@ from pydantic import BaseModel
 # 确保 backend 目录在 sys.path 中
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+import time as _time
+
 from config import cfg
 from llm.client import AsyncLLMClient
 from rag.milvus_client import MilvusManager
@@ -37,6 +39,7 @@ from memory.reflection_manager import ReflectionManager
 from workflow.medical_orchestrator import MedicalOrchestrator
 from tools.literature_search import set_retriever
 from schema.models import MedicalQuery
+from monitoring.metrics import SessionMetrics
 
 # 配置日志格式
 logging.basicConfig(
@@ -62,6 +65,7 @@ BUILTIN_KB = [
 # 全局组件
 orchestrator: MedicalOrchestrator | None = None
 milvus_connected: bool = False
+session_metrics = SessionMetrics()
 
 
 class QueryRequest(BaseModel):
@@ -154,9 +158,21 @@ async def query(req: QueryRequest):
     if orchestrator is None:
         return {"error": "系统尚未初始化"}
 
+    t_start = _time.perf_counter()
     logger.info(f"收到查询: '{req.query}' (user={req.user_id})")
     medical_q = MedicalQuery(query=req.query, user_id=req.user_id)
     response = await orchestrator.process(medical_q)
+    latency_ms = (_time.perf_counter() - t_start) * 1000
+
+    # 更新监控指标
+    from monitoring.metrics import RequestMetrics
+    session_metrics.add(RequestMetrics(
+        query=req.query,
+        route_path=response.route_path,
+        total_latency_ms=latency_ms,
+        final_confidence=response.confidence,
+        is_safe_fallback=response.is_safe_fallback,
+    ))
 
     return {
         "answer": response.answer,
@@ -165,6 +181,7 @@ async def query(req: QueryRequest):
         "sources": response.sources,
         "confidence": response.confidence,
         "is_safe_fallback": response.is_safe_fallback,
+        "latency_ms": round(latency_ms, 2),
     }
 
 
@@ -172,6 +189,15 @@ async def query(req: QueryRequest):
 async def health():
     """健康检查"""
     return {"status": "ok", "milvus": milvus_connected}
+
+
+@app.get("/api/metrics")
+async def metrics():
+    """RAG 监控指标"""
+    return {
+        "session": session_metrics.to_dict(),
+        "milvus_connected": milvus_connected,
+    }
 
 
 @app.websocket("/ws/query")
