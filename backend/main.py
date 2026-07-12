@@ -39,7 +39,7 @@ from memory.reflection_manager import ReflectionManager
 from workflow.medical_orchestrator import MedicalOrchestrator
 from tools.literature_search import set_retriever
 from schema.models import MedicalQuery
-from monitoring.metrics import SessionMetrics
+from monitoring.metrics import SessionMetrics, RequestMetrics
 
 # 配置日志格式
 logging.basicConfig(
@@ -165,7 +165,6 @@ async def query(req: QueryRequest):
     latency_ms = (_time.perf_counter() - t_start) * 1000
 
     # 更新监控指标
-    from monitoring.metrics import RequestMetrics
     session_metrics.add(RequestMetrics(
         query=req.query,
         route_path=response.route_path,

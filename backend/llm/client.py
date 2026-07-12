@@ -11,6 +11,7 @@ from __future__ import annotations
 import logging
 from typing import Optional
 
+import httpx
 from openai import AsyncOpenAI
 
 from config import cfg
@@ -36,6 +37,8 @@ class AsyncLLMClient:
         self.client = AsyncOpenAI(
             base_url=base_url,
             api_key=api_key if api_key else "sk-placeholder",
+            timeout=httpx.Timeout(120.0, connect=10.0),
+            max_retries=2,
         )
         self.model = model
         self._api_key_configured = bool(api_key)

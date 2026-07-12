@@ -57,7 +57,7 @@ reranker:
   original_weight: 0.3                     # LLM 重排: 原始分数权重
   ngram_weight: 0.5                        # n-gram 重排: n-gram 权重
   ngram_original_weight: 0.5               # n-gram 重排: 原始分数权重
-  content_preview_length: 300              # LLM 重排时截取文档内容长度
+  content_preview_length: 1024              # CrossEncoder 截取文档内容长度
 
 # ---- 置信度评估 ----
 confidence:

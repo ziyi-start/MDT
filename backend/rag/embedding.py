@@ -5,6 +5,7 @@
 """
 from __future__ import annotations
 
+import asyncio
 import re
 import logging
 from functools import lru_cache
@@ -26,13 +27,15 @@ def _get_embedding_model():
     if _EMBEDDING_MODEL is None:
         try:
             from sentence_transformers import SentenceTransformer
+            import torch
+            device = "cuda" if torch.cuda.is_available() else "cpu"
             logger.info("正在加载 BGE Embedding 模型...")
             _EMBEDDING_MODEL = SentenceTransformer(
                 'BAAI/bge-small-zh-v1.5',
-                device='cpu',
+                device=device,
             )
             dim = _EMBEDDING_MODEL.get_embedding_dimension()
-            logger.info(f"BGE 模型加载成功，向量维度: {dim}")
+            logger.info(f"BGE 模型加载成功，向量维度: {dim}, 设备: {device}")
         except Exception as e:
             logger.error(f"BGE 模型加载失败: {e}")
             raise
@@ -53,10 +56,11 @@ async def dummy_embed(text: str) -> list[float]:
     生成真实语义向量，512 维，L2 归一化。
     用 named dummy_embed 保持与现有代码兼容。
     """
-    return list(_encode(text))
+    return await asyncio.to_thread(lambda: list(_encode(text)))
 
 
-def extract_chinese_terms(text: str) -> set[str]:
+@lru_cache(maxsize=512)
+def extract_chinese_terms(text: str) -> frozenset[str]:
     """提取中文文本中的关键词 (2-4 字 n-gram + 英文词)
     用于内存模式下的关键词匹配检索。
     """

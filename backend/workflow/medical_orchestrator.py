@@ -144,19 +144,18 @@ class MedicalOrchestrator:
             set_current_profile(profile)
 
             # ---- Step 2: CoT 安全退避预检 ----
-            # 先检查检索是否有结果。若无任何相关文档，直接触发退避。
-            # 注意: 原始检索分数范围因检索方式不同差异较大，不在此处做分数阈值判断，
-            # 真正的 Reranker 分数阈值检查在各工作流内部的 rerank 之后执行。
+            # 检索是否有结果。若为空，直接触发退避。
             quick_docs = await self.retriever.retrieve(query.query, profile=profile, top_k=cfg.retrieval.quick_check_top_k)
             if not quick_docs:
                 logger.warning("CoT 安全退避: 检索结果为空")
-                # 检索为空说明知识库无相关知识，不存储无意义的反思三元组
                 return MedicalResponse(
                     answer=SAFE_FALLBACK_RESPONSE,
                     route_path="safe_fallback",
                     confidence=0.0,
                     is_safe_fallback=True,
                 )
+            # 保存预检结果供后续复用，避免重复检索
+            self._pre_retrieved = quick_docs
 
             # ---- Step 3: 闭环动态路由 ----
             if llm_available:

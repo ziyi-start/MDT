@@ -30,6 +30,7 @@ class MilvusManager:
     def __init__(self, uri: str = ""):
         self.uri = uri or cfg.milvus.uri
         self._client: Optional[MilvusClient] = None
+        self._loaded: set[str] = set()
 
     def connect(self):
         """连接 Milvus 服务"""
@@ -181,9 +182,12 @@ class MilvusManager:
         self.client.insert(collection_name=collection_name, data=data)
 
     def _load_collection(self, collection_name: str):
-        """加载集合到内存（Milvus 搜索前必须 load）"""
+        """加载集合到内存（Milvus 搜索前必须 load），跳过已加载的"""
+        if collection_name in self._loaded:
+            return
         try:
             self.client.load_collection(collection_name=collection_name)
+            self._loaded.add(collection_name)
         except Exception as e:
             logger.debug(f"加载集合 {collection_name}: {e}")
 

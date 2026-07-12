@@ -26,10 +26,12 @@ def _get_cross_encoder():
     if _CROSS_ENCODER is None:
         try:
             from sentence_transformers import CrossEncoder
+            import torch
+            device = "cuda" if torch.cuda.is_available() else "cpu"
             logger.info("正在加载 BGE-Reranker 模型...")
             _CROSS_ENCODER = CrossEncoder(
                 'BAAI/bge-reranker-v2-m3',
-                device='cpu',
+                device=device,
             )
             logger.info("BGE-Reranker 模型加载成功")
         except Exception as e:
@@ -85,7 +87,8 @@ class MedicalReranker:
         """使用 BGE-Reranker Cross-Encoder 对 (query, doc) 逐对打分"""
         model = _get_cross_encoder()
 
-        pairs = [(query, doc.content) for doc in documents]
+        max_len = cfg.reranker.content_preview_length or 1024
+        pairs = [(query, doc.content[:max_len]) for doc in documents]
         scores = model.predict(pairs, show_progress_bar=False)
 
         scored_docs = []
