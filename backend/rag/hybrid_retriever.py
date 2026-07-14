@@ -40,7 +40,6 @@ class HybridRetriever:
         query: str,
         profile: Optional[PatientProfile] = None,
         top_k: int = 0,
-        departments: list[str] | None = None,
     ) -> list[DocumentChunk]:
         """执行混合检索（完整流程）
 
@@ -118,29 +117,6 @@ class HybridRetriever:
                 logger.warning(f"Milvus Dense 检索也失败: {e2}")
 
         return self._milvus_results_to_chunks(results)
-
-    def _keyword_rerank_as_bm25(
-        self, query: str, dense_results: list[dict], limit: int
-    ) -> list[dict]:
-        """用关键词匹配模拟 BM25 排名（BM25 不可用时的退化方案）
-
-        对 Dense 检索结果做关键词重叠度评分，作为 BM25 一路的排名输入。
-        """
-        from rag.embedding import extract_chinese_terms
-        query_terms = extract_chinese_terms(query)
-        if not query_terms:
-            return []
-
-        scored = []
-        for doc in dense_results:
-            content = doc.get("content", "")
-            content_terms = extract_chinese_terms(content)
-            overlap = len(query_terms & content_terms)
-            score = overlap / max(len(query_terms), 1)
-            scored.append((score, doc))
-
-        scored.sort(key=lambda x: x[0], reverse=True)
-        return [doc for _, doc in scored[:limit]]
 
     def _rrf_fusion(
         self,

@@ -5,9 +5,17 @@
 - 向量化后存入 Milvus Reflection_Mem 集合
 - 下次遇到相似 Query 时检索反思记忆，高相似度命中则强插 Hint 预警
 
+Agent 自进化增强:
+- 每次检索命中时递增 usage_count（"从教训中学习"的效果可衡量）
+- provenance 追踪每个反思的来源
+
 CoT 安全退避机制:
 - Reranker 最高分低于极低阈值（0.2）时，触发退避
 - 此异常应在 MDT 流程中被检查并抛出
+
+与 SkillManager 的职责分离:
+- ReflectionManager: 从失败中提取"不要做什么"（避坑）
+- SkillManager:    从成功中提取"应该怎么做"（最佳实践）
 """
 from __future__ import annotations
 
@@ -121,6 +129,32 @@ class ReflectionManager:
             _IN_MEMORY_REFLECTIONS = _IN_MEMORY_REFLECTIONS[-self._max_in_memory // 2:]
         _IN_MEMORY_REFLECTIONS.append(triple.model_dump())
 
+    def _increment_usage(self, triple_id: str):
+        """反思被命中时，递增使用计数"""
+        if not self.milvus or not triple_id:
+            return
+        try:
+            results = self.milvus.client.query(
+                collection_name=cfg.milvus.collections.reflection,
+                filter=f'triple_id == "{triple_id}"',
+                output_fields=["usage_count"],
+            )
+            if results:
+                current = results[0].get("usage_count", 0)
+                self.milvus.client.upsert(
+                    collection_name=cfg.milvus.collections.reflection,
+                    data=[{"triple_id": triple_id, "usage_count": current + 1}],
+                )
+        except Exception:
+            pass
+
+    async def stats(self) -> dict:
+        """反思管理器统计"""
+        return {
+            "in_memory_count": len(_IN_MEMORY_REFLECTIONS),
+            "milvus_available": self.milvus is not None,
+        }
+
     async def search_reflection(self, query: str, threshold: float | None = None) -> Optional[str]:
         """检索反思记忆，返回避坑动作 Hint
 
@@ -141,6 +175,7 @@ class ReflectionManager:
                 )
                 if results and results[0].get("score", 0) >= threshold:
                     hit = results[0]
+                    self._increment_usage(hit.get("triple_id", ""))
                     hint = f"⚠️历史教训：{hit.get('avoid_action', '')}"
                     logger.info(f"反思命中 (Milvus): {hint}")
                     return hint

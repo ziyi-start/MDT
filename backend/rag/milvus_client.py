@@ -169,6 +169,51 @@ class MilvusManager:
         self.client.create_collection(name, schema=schema, index_params=index_params)
         logger.info(f"创建集合: {name}")
 
+    def create_skill_collection(self, name: str = ""):
+        """创建技能记忆集合 - 从成功回答中提炼的可复用策略
+
+        字段说明:
+        - skill_id: 技能唯一标识（主键）
+        - embedding: 技能向量（用于相似场景检索）
+        - intent: 技能触发意图（什么场景用）
+        - action: 规范化处理策略（怎么做）
+        - departments: 适用科室 JSON 列表
+        - source_query: 来源用户查询
+        - route_path: 来源路由路径
+        - provenance: 来源追踪标识
+        - version: 版本号
+        - usage_count: 被检索使用次数
+        - last_used: 最后使用时间
+        - status: active | superseded | discarded
+        """
+        name = name or cfg.milvus.collections.skill
+        if self.client.has_collection(name):
+            return
+        schema = self.client.create_schema(auto_id=False, enable_dynamic_field=True)
+        schema.add_field("skill_id", DataType.VARCHAR, max_length=128, is_primary=True)
+        schema.add_field("embedding", DataType.FLOAT_VECTOR, dim=EMBEDDING_DIM)
+        schema.add_field("intent", DataType.VARCHAR, max_length=1024)
+        schema.add_field("action", DataType.VARCHAR, max_length=4096)
+        schema.add_field("departments", DataType.VARCHAR, max_length=512)
+        schema.add_field("source_query", DataType.VARCHAR, max_length=1024)
+        schema.add_field("route_path", DataType.VARCHAR, max_length=128)
+        schema.add_field("provenance", DataType.VARCHAR, max_length=256)
+        schema.add_field("version", DataType.INT32)
+        schema.add_field("usage_count", DataType.INT32)
+        schema.add_field("last_used", DataType.VARCHAR, max_length=64)
+        schema.add_field("status", DataType.VARCHAR, max_length=32)
+
+        index_params = self.client.prepare_index_params()
+        index_params.add_index(
+            "embedding",
+            index_type=cfg.milvus.index.type,
+            metric_type=cfg.milvus.index.metric_type,
+            params=cfg.milvus.index.params,
+        )
+
+        self.client.create_collection(name, schema=schema, index_params=index_params)
+        logger.info(f"创建集合: {name} (Skills 自进化)")
+
     # ============================================================
     # 通用数据操作
     # ============================================================
@@ -354,4 +399,5 @@ class MilvusManager:
         self.create_kb_collection()
         self.create_profile_collection()
         self.create_reflection_collection()
-        logger.info("所有 Milvus 集合初始化完成")
+        self.create_skill_collection()
+        logger.info("所有 Milvus 集合初始化完成 (含 Skill_Mem)")

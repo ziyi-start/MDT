@@ -37,6 +37,7 @@ class SimpleRAGWorkflow:
 
     async def run(
         self, query: MedicalQuery, profile: PatientProfile | None = None,
+        skill_hints: str = "",
     ) -> tuple[MedicalResponse, list[DocumentChunk]]:
         """执行简单 RAG 流程
 
@@ -83,6 +84,8 @@ class SimpleRAGWorkflow:
         system_prompt = SIMPLE_RAG_SYSTEM_PROMPT
         if reflection_hint:
             system_prompt += f"\n\n{reflection_hint}"
+        if skill_hints:
+            system_prompt += f"\n\n{skill_hints}"
 
         resp = await self.llm.chat(
             messages=[

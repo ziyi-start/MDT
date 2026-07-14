@@ -56,6 +56,7 @@ class MDTConsultationWorkflow:
         query: MedicalQuery,
         departments: list[str],
         escalation_reason: str = "",
+        skill_hints: str = "",
     ) -> MedicalResponse:
         """执行 MDT 会诊
 
@@ -63,6 +64,7 @@ class MDTConsultationWorkflow:
             query: 用户查询
             departments: 招募的科室列表
             escalation_reason: 如果是从 Simple RAG 升级而来，携带失败原因
+            skill_hints: 从成功经验中提取的可复用技能提示
         """
         logger.info(f"MDT 会诊: departments={departments}")
 
@@ -86,6 +88,8 @@ class MDTConsultationWorkflow:
                 department=dept,
                 reflection_hint=reflection_hint,
             )
+            if skill_hints:
+                system_prompt += f"\n\n{skill_hints}"
             # 注入患者画像到专家 System Prompt
             if self.profile:
                 system_prompt += (
@@ -111,22 +115,37 @@ class MDTConsultationWorkflow:
         ]
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
-        # 收集各专家结果（异常不中断，记录为错误信息）
-        expert_opinions = []
+        # 收集各专家结果，异常结果不进入共识，避免污染 LLM 输入
+        successful_opinions = []
+        failed_departments: list[str] = []
         for (dept, _), result in zip(experts, results):
             if isinstance(result, Exception):
                 logger.error(f"专家 {dept} 会诊失败: {result}")
-                expert_opinions.append(f"[{dept}] 会诊异常: {str(result)}")
+                failed_departments.append(dept)
             else:
-                expert_opinions.append(f"[{dept}]\n{result}")
+                successful_opinions.append(f"[{dept}]\n{result}")
 
-        # 5. 共识提炼: 收集多专家结果，调用 LLM 提炼最终会诊报告
+        # E2: 最少专家成功阈值 —— 全部失败时触发安全退避
+        if not successful_opinions:
+            logger.warning(f"所有 {len(experts)} 位专家均会诊失败 ({failed_departments})，触发安全退避")
+            return MedicalResponse(
+                answer=SAFE_FALLBACK_RESPONSE,
+                route_path="safe_fallback",
+                confidence=0.0,
+                departments=departments,
+                is_safe_fallback=True,
+            )
+
+        if failed_departments:
+            logger.warning(f"部分专家失败 ({len(failed_departments)}/{len(experts)}): {failed_departments}，以 {len(successful_opinions)} 位成功专家意见继续")
+
+        # 5. 共识提炼: 仅用成功专家结果，调用 LLM 提炼最终会诊报告
         profile_text = ""
         if self.profile:
             profile_text = f"疾病={self.profile.diseases}, 用药={self.profile.medications}, 过敏={self.profile.allergies}"
 
         consensus_prompt = CONSENSUS_PROMPT.format(
-            expert_opinions="\n\n".join(expert_opinions),
+            expert_opinions="\n\n".join(successful_opinions),
             profile=profile_text or "无",
         )
 
@@ -175,8 +194,8 @@ class MDTConsultationWorkflow:
             else:
                 final_answer = consensus_text
         except Exception as e:
-            logger.warning(f"共识引导检索失败: {e}")
-            final_answer = consensus_text
+            logger.warning(f"共识引导检索失败，输出未经验证的共识: {e}")
+            final_answer = consensus_text + "\n\n⚠️ 注意：此结论的检索验证步骤失败，建议谨慎参考。"
 
         response = MedicalResponse(
             answer=final_answer,

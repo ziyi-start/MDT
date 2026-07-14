@@ -59,6 +59,32 @@ class MedicalResponse(BaseModel):
     is_safe_fallback: bool = Field(default=False, description="是否为安全退避回复（宁拒答不幻觉）")
 
 
+class Skill(BaseModel):
+    """可复用技能 - 从成功回答中提取的规范化处理策略
+
+    设计理念: 将"怎么做"从"知道什么"中分离出来。
+    - intent: 触发条件（何时用这个技能）
+    - action: 处理策略（怎么做）
+    - departments: 适用科室
+    - provenance: 来源追踪
+    - version: 版本号，merge 时递增
+    - usage_count: 被检索使用次数
+    - last_used: 最后使用时间
+    - status: active | superseded | discarded
+    """
+    skill_id: str = ""
+    intent: str = Field(description="技能触发意图，如'高血压合并痛风患者止痛方案'")
+    action: str = Field(description="规范化处理策略，如'禁用NSAIDs，优先对乙酰氨基酚或秋水仙碱'")
+    departments: list[str] = Field(default_factory=list, description="适用科室列表")
+    source_query: str = Field(default="", description="来源用户查询")
+    route_path: str = Field(default="", description="来源路由路径")
+    provenance: str = Field(default="", description="来源追踪标识")
+    version: int = Field(default=1, description="版本号")
+    usage_count: int = Field(default=0, description="被检索使用次数")
+    last_used: str = Field(default="", description="最后使用时间")
+    status: str = Field(default="active", description="active | superseded | discarded")
+
+
 class DocumentChunk(BaseModel):
     """检索文档片段 - 混合检索和重排的基本单元"""
     doc_id: str = Field(description="文档唯一标识")

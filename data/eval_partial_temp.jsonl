@@ -1,0 +1,3 @@
+{"idx": 0, "query": "经调查证实出现医院感染流行时，医院应报告当地卫生行政部门的时间是（　　）。", "predicted": "D", "expected": "E", "is_correct": false, "faithful": null, "retrieval_mrr": 0.0, "num_relevant": 0, "hit_at_k": {"1": false, "2": false, "3": false, "4": false, "5": false}}
+{"idx": 1, "query": "8岁男孩，右肘关节外伤，当地摄X线片诊断肱骨髁上骨折，经两次手法复位未成功，来院时为伤后48小时。查体：右肘关节半屈位，肿胀较重，压痛明显，手指活动障碍，桡动脉", "predicted": "C", "expected": "C", "is_correct": true, "faithful": null, "retrieval_mrr": 0.0, "num_relevant": 0, "hit_at_k": {"1": false, "2": false, "3": false, "4": false, "5": false}}
+{"idx": 2, "query": "最易引起输血后肝炎的病毒是（　　）。", "predicted": "C", "expected": "C", "is_correct": true, "faithful": null, "retrieval_mrr": 0.0, "num_relevant": 0, "hit_at_k": {"1": false, "2": false, "3": false, "4": false, "5": false}}

@@ -36,6 +36,7 @@ from rag.hybrid_retriever import HybridRetriever, load_in_memory_kb
 from rag.reranker import MedicalReranker
 from memory.profile_extractor import ProfileExtractor
 from memory.reflection_manager import ReflectionManager
+from memory.skill_manager import SkillManager
 from workflow.medical_orchestrator import MedicalOrchestrator
 from tools.literature_search import set_retriever
 from schema.models import MedicalQuery
@@ -66,6 +67,17 @@ BUILTIN_KB = [
 orchestrator: MedicalOrchestrator | None = None
 milvus_connected: bool = False
 session_metrics = SessionMetrics()
+
+# Harness 全局组件
+from monitoring.tracing import trace_manager
+from harness.evaluator import HarnessEvaluator
+from harness.experiment import ExperimentTracker
+from engine.safety_guard import SafetyGuard, RateLimiter, CostTracker, validate_tool_args
+from context.manager import ContextManager, ContextBudget
+
+harness_evaluator = HarnessEvaluator()
+experiment_tracker = ExperimentTracker()
+safety_guard: SafetyGuard | None = None
 
 
 class QueryRequest(BaseModel):
@@ -133,18 +145,46 @@ async def lifespan(app: FastAPI):
     # ---- 记忆模块 ----
     profile_extractor = ProfileExtractor(llm, milvus)
     reflection_manager = ReflectionManager(llm, milvus)
+    skill_manager = SkillManager(llm, milvus)
 
-    # ---- 顶层编排器 ----
+    # ---- Harness: 安全守卫 ----
+    global safety_guard
+    if cfg.harness.safety.cost_tracking_enabled:
+        rate_limiter = RateLimiter(
+            max_calls=cfg.harness.safety.rate_limit_max_calls,
+            window_seconds=cfg.harness.safety.rate_limit_window_sec,
+        )
+        cost_tracker = CostTracker()
+        safety_guard = SafetyGuard(rate_limiter=rate_limiter, cost_tracker=cost_tracker)
+        safety_guard.add_pre_hook(validate_tool_args)
+        logger.info("安全守卫初始化完成 (限流+成本追踪)")
+
+    # ---- Harness: 上下文预算 ----
+    ctx_budget = ContextBudget(
+        permanent_tokens=cfg.harness.context.permanent_tokens,
+        working_tokens=cfg.harness.context.working_tokens,
+        deep_tokens=cfg.harness.context.deep_tokens,
+        total_tokens=cfg.harness.context.total_tokens,
+    )
+    context_manager = ContextManager(budget=ctx_budget)
+    logger.info(f"上下文预算管理器初始化完成 (total={ctx_budget.total_tokens})")
+
+    # ---- 顶层编排器 (含 Harness 增强 + Agent 自进化) ----
     orchestrator = MedicalOrchestrator(
         llm=llm,
         retriever=retriever,
         reranker=reranker,
         profile_extractor=profile_extractor,
         reflection_manager=reflection_manager,
+        skill_manager=skill_manager,
         ner_service_url=cfg.services.ner_url,
+        enable_tracing=cfg.harness.tracing.enabled,
+        safety_guard=safety_guard,
+        context_manager=context_manager,
+        harness_evaluator=harness_evaluator,
     )
 
-    logger.info("系统初始化完成！")
+    logger.info("系统初始化完成！(含 Harness: 追踪+评估+安全守卫+上下文预算)")
     yield
     logger.info("系统关闭")
 
@@ -196,6 +236,78 @@ async def metrics():
     return {
         "session": session_metrics.to_dict(),
         "milvus_connected": milvus_connected,
+        "harness": {
+            "tracing": trace_manager.stats,
+            "safety": safety_guard.cost_tracker.to_dict() if safety_guard else {"status": "disabled"},
+        },
+    }
+
+
+# ============================================================
+# Harness API 端点
+# ============================================================
+
+@app.get("/api/harness/traces")
+async def list_traces(n: int = 10):
+    """获取最近的追踪记录"""
+    return {"traces": trace_manager.get_recent(n)}
+
+
+@app.get("/api/harness/traces/{trace_id}")
+async def get_trace(trace_id: str):
+    """获取特定追踪详情"""
+    trace = trace_manager.get_active(trace_id)
+    if trace:
+        return trace.to_dict()
+    for t in trace_manager._completed_traces[-100:]:
+        if t.trace_id == trace_id:
+            return t.to_dict()
+    return {"error": "trace not found"}
+
+
+@app.get("/api/harness/evaluate")
+async def evaluate():
+    """执行 7维 Harness 评估（基于当前会话指标）"""
+    if harness_evaluator is None:
+        return {"error": "评估器未初始化"}
+
+    from schema.models import MedicalResponse
+    # 构造模拟响应用于评估
+    recent = trace_manager.get_recent(50)
+    if not recent:
+        return {"error": "没有足够的请求数据用于评估"}
+
+    for t in recent:
+        resp = MedicalResponse(
+            answer="评估样本",
+            route_path="simple_rag",
+            confidence=0.8,
+            sources=["sample"],
+        )
+        harness_evaluator.add_result(resp, t.get("total_ms", 1000))
+
+    report = harness_evaluator.evaluate()
+    return report.to_dict()
+
+
+@app.get("/api/harness/experiments")
+async def list_experiments():
+    """列出所有实验记录"""
+    return {"experiments": experiment_tracker.list_experiments()}
+
+
+@app.get("/api/harness/safety")
+async def safety_stats():
+    """安全守卫统计"""
+    if safety_guard is None:
+        return {"status": "disabled", "message": "安全守卫未启用"}
+    return {
+        "status": "enabled",
+        "cost_tracking": safety_guard.cost_tracker.to_dict(),
+        "rate_limiter": {
+            "max_calls": cfg.harness.safety.rate_limit_max_calls,
+            "window_sec": cfg.harness.safety.rate_limit_window_sec,
+        },
     }
 
 

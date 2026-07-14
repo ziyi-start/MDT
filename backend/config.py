@@ -82,6 +82,7 @@ class MilvusCollectionsConfig:
     kb: str = "Medical_KB"
     profile: str = "Patient_Profile"
     reflection: str = "Reflection_Mem"
+    skill: str = "Skill_Mem"
 
 
 @dataclass
@@ -150,6 +151,16 @@ class ReflectionConfig:
 
 
 @dataclass
+class SkillConfig:
+    search_threshold: float = 0.6
+    similarity_threshold: float = 0.75
+    max_in_memory: int = 100
+    max_return: int = 3
+    extraction_enabled: bool = True
+    min_confidence_for_extraction: float = 0.7
+
+
+@dataclass
 class ServicesConfig:
     ner_url: str = ""
     rerank_api_url: str = ""
@@ -165,6 +176,41 @@ class ServerConfig:
 
 
 @dataclass
+class HarnessTracingConfig:
+    enabled: bool = True
+    max_completed_traces: int = 1000
+
+
+@dataclass
+class HarnessEvaluatorConfig:
+    enabled: bool = True
+    baseline_path: str = ""
+
+
+@dataclass
+class HarnessSafetyConfig:
+    rate_limit_max_calls: int = 20
+    rate_limit_window_sec: int = 60
+    cost_tracking_enabled: bool = True
+
+
+@dataclass
+class HarnessContextConfig:
+    permanent_tokens: int = 2000
+    working_tokens: int = 4000
+    deep_tokens: int = 8000
+    total_tokens: int = 14000
+
+
+@dataclass
+class HarnessConfig:
+    tracing: HarnessTracingConfig = field(default_factory=HarnessTracingConfig)
+    evaluator: HarnessEvaluatorConfig = field(default_factory=HarnessEvaluatorConfig)
+    safety: HarnessSafetyConfig = field(default_factory=HarnessSafetyConfig)
+    context: HarnessContextConfig = field(default_factory=HarnessContextConfig)
+
+
+@dataclass
 class AppConfig:
     llm: LLMConfig = field(default_factory=LLMConfig)
     milvus: MilvusConfig = field(default_factory=MilvusConfig)
@@ -174,8 +220,10 @@ class AppConfig:
     decision_maker: DecisionMakerConfig = field(default_factory=DecisionMakerConfig)
     react: ReactConfig = field(default_factory=ReactConfig)
     reflection: ReflectionConfig = field(default_factory=ReflectionConfig)
+    skill: SkillConfig = field(default_factory=SkillConfig)
     services: ServicesConfig = field(default_factory=ServicesConfig)
     server: ServerConfig = field(default_factory=ServerConfig)
+    harness: HarnessConfig = field(default_factory=HarnessConfig)
     default_user_id: str = "default_user"
 
 

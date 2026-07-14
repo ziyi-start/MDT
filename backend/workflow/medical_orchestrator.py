@@ -6,12 +6,19 @@
 3. 记忆与检索协同层: 画像更新 → 混合检索 → 共识引导检索 → 重排 → CoT退避
 4. 反思与决策层: Decision Maker → 归因反思 → 安全退避
 
+Harness 增强 (Agent = Model + Harness):
+5. 追踪观测层: TraceID 传播 + Span 记录 + 执行图
+6. 评估层: 7维确定性评分 + 基线对比
+7. 安全守卫层: 工具调用验证 + 限流 + 成本追踪
+8. 上下文预算层: 分层加载 + Token 预算管理
+
 完整闭环: 查询 → 画像更新 → 路由 → 执行 → 共识引导检索 → 评估 → (升级/退避/输出)
 """
 from __future__ import annotations
 
 import json
 import logging
+import time
 
 from schema.models import MedicalQuery, MedicalResponse, PatientProfile, RouteDecision
 from llm.client import AsyncLLMClient
@@ -23,8 +30,11 @@ from workflow.simple_rag import SimpleRAGWorkflow
 from workflow.mdt_consultation import MDTConsultationWorkflow
 from memory.profile_extractor import ProfileExtractor
 from memory.reflection_manager import ReflectionManager, InsufficientInformationException
+from memory.skill_manager import SkillManager
 from rag.hybrid_retriever import HybridRetriever
 from rag.reranker import MedicalReranker
+from monitoring.metrics import PipelineTimer
+from monitoring.tracing import TraceContext, trace_manager
 from schema.messages import Message
 from config import cfg
 
@@ -78,9 +88,10 @@ class DecisionMaker:
             data.setdefault("reason", "")
             return data
         except json.JSONDecodeError:
-            # LLM 输出解析失败时，默认通过（避免误拦截）
-            logger.warning("Decision Maker 输出解析失败，默认通过")
-            return {"approved": True, "quality_score": 0.5, "reason": "评估结果解析失败"}
+            logger.warning("Decision Maker 输出解析失败，保守退避")
+            return {"approved": False, "quality_score": 0.0, "hallucination_risk": "high",
+                    "logical_gaps": [], "safety_concerns": ["评估结果解析失败"],
+                    "reason": "评估结果解析失败，保守退避"}
 
 
 class MedicalOrchestrator:
@@ -95,6 +106,12 @@ class MedicalOrchestrator:
     6. 共识引导检索（MDT 内部：共识摘要 → Hybrid检索 → Reranker → LLM验证）
     7. Decision Maker 评估（MDT 末尾，基于证据验证后的共识，可能触发反思/退避）
     8. 失败处理（反思沉淀 / CoT退避 / 携因打回）
+
+    Harness 增强:
+    9. 追踪观测: TraceID 贯穿全流程 + Span 阶段计时 + 执行图
+    10. 安全守卫: 工具调用验证 + 限流 + 成本追踪
+    11. 上下文预算: 分层加载 + Token 预算管理
+    12. 在线评估: 7维确定性评分
     """
 
     def __init__(
@@ -104,13 +121,21 @@ class MedicalOrchestrator:
         reranker: MedicalReranker,
         profile_extractor: ProfileExtractor,
         reflection_manager: ReflectionManager,
+        skill_manager: Optional[SkillManager] = None,
         ner_service_url: str = "",
+        enable_tracing: bool = True,
+        safety_guard=None,
+        context_manager=None,
+        harness_evaluator=None,
     ):
         self.llm = llm
         self.retriever = retriever
         self.reranker = reranker
         self.profile_extractor = profile_extractor
         self.reflection = reflection_manager
+
+        # Agent 自进化: 技能管理器
+        self.skill_manager = skill_manager
 
         # 路由组件
         self.rule_interceptor = RuleInterceptor(ner_service_url=ner_service_url)
@@ -120,9 +145,25 @@ class MedicalOrchestrator:
         # 决策器（安全阀）
         self.decision_maker = DecisionMaker(llm)
 
+        # Harness 组件
+        self.enable_tracing = enable_tracing
+        self.safety_guard = safety_guard
+        self.context_manager = context_manager
+        self.harness_evaluator = harness_evaluator
+
     async def process(self, query: MedicalQuery) -> MedicalResponse:
         """处理用户查询 - 主入口"""
+        start_time = time.time()
         logger.info(f"开始处理查询: '{query.query}' (user={query.user_id})")
+
+        # ---- Harness: 创建追踪上下文 ----
+        trace = None
+        if self.enable_tracing:
+            trace = trace_manager.begin_trace(
+                name=f"query:{query.query[:30]}",
+                trace_id=f"t_{query.user_id}_{int(start_time)}",
+            )
+            trace.begin_span("process", metadata={"query": query.query, "user_id": query.user_id})
 
         # ---- Step 0: LLM 可用性检查 ----
         # 未配置 API key 时，LLM 不可用，走纯检索路径
@@ -130,74 +171,127 @@ class MedicalOrchestrator:
 
         try:
             # ---- Step 1: 渐进式画像更新 ----
+            timer = PipelineTimer()
+            if trace:
+                trace.begin_span("profile_update", parent=trace._roots[0].span_id if trace._roots else None)
             # 将画像注入到工具模块，使 Agent 在 ReAct 循环中调用检索时也能享受画像约束
             from tools.literature_search import set_current_profile
             # LLM 可用时才做画像抽取（需要调用 LLM），否则使用空画像
             if llm_available:
-                profile = await self.profile_extractor.extract_and_update(
-                    query.user_id, query.query
-                )
+                with timer.stage("profile_update"):
+                    profile = await self.profile_extractor.extract_and_update(
+                        query.user_id, query.query
+                    )
             else:
                 profile = self.profile_extractor.get_profile(query.user_id)
 
             # 注入画像到工具模块，使 Agent 调用 literature_search 时自动携带画像约束
             set_current_profile(profile)
+            if trace:
+                trace.end_span(trace._stack[-1].span_id if trace._stack else "")
 
             # ---- Step 2: CoT 安全退避预检 ----
-            # 检索是否有结果。若为空，直接触发退避。
-            quick_docs = await self.retriever.retrieve(query.query, profile=profile, top_k=cfg.retrieval.quick_check_top_k)
+            with timer.stage("cot_precheck"):
+                if trace:
+                    trace.begin_span("cot_precheck")
+                quick_docs = await self.retriever.retrieve(query.query, profile=profile, top_k=cfg.retrieval.quick_check_top_k)
+                if trace:
+                    trace.end_span(trace._stack[-1].span_id if trace._stack else "",
+                                   metadata={"num_docs": len(quick_docs)})
             if not quick_docs:
                 logger.warning("CoT 安全退避: 检索结果为空")
+                if trace:
+                    trace.end_span(trace._roots[0].span_id if trace._roots else "", status="fallback")
+                    trace_manager.end_trace(trace.trace_id)
                 return MedicalResponse(
                     answer=SAFE_FALLBACK_RESPONSE,
                     route_path="safe_fallback",
                     confidence=0.0,
                     is_safe_fallback=True,
                 )
-            # 保存预检结果供后续复用，避免重复检索
-            self._pre_retrieved = quick_docs
+
+            # ---- Agent 自进化: 检索相关技能注入上下文 ----
+            skill_hints = ""
+            if self.skill_manager and cfg.skill.extraction_enabled:
+                try:
+                    skills = await self.skill_manager.search_skills(query.query)
+                    if skills:
+                        skill_lines = []
+                        for s in skills:
+                            skill_lines.append(f"[技能] {s.intent}: {s.action}")
+                        skill_hints = "\n参考既往成功经验：\n" + "\n".join(skill_lines)
+                        logger.info(f"技能命中: {len(skills)} 条")
+                except Exception as e:
+                    logger.debug(f"技能检索失败: {e}")
 
             # ---- Step 3: 闭环动态路由 ----
             if llm_available:
-                decision = await self._route_async(query.query, profile)
+                with timer.stage("routing"):
+                    if trace:
+                        trace.begin_span("routing")
+                    decision = await self._route_async(query.query, profile)
+                    if trace:
+                        trace.end_span(trace._stack[-1].span_id if trace._stack else "",
+                                       metadata={"route": decision.route_path, "departments": decision.departments})
             else:
-                # LLM 不可用时，只用规则拦截（快车道），灰度问题走 simple_rag
                 decision = self.rule_interceptor.intercept(query.query)
                 if decision is None:
                     decision = RouteDecision(route_path="simple_rag", departments=[])
 
             # ---- Step 4: 执行工作流 ----
             if not llm_available:
-                # LLM 不可用: 走纯检索路径，拼接文档作为回答
                 return await self._retrieval_only_response(query, profile, decision)
 
             if decision.route_path == "simple_rag":
-                # 简单 RAG 路径
-                response, docs = await self._run_simple_rag(query, profile)
+                if trace:
+                    trace.begin_span("execute_simple_rag")
+                response, docs = await self._run_simple_rag(query, profile, skill_hints=skill_hints)
+                if trace:
+                    trace.end_span(trace._stack[-1].span_id if trace._stack else "")
 
                 # ---- Step 5: 置信度评估 → 可能升级到 MDT ----
                 try:
+                    if trace:
+                        trace.begin_span("confidence_check")
                     await self.confidence_checker.evaluate(response.answer, docs)
+                    if trace:
+                        trace.end_span(trace._stack[-1].span_id if trace._stack else "")
+                    await self._log_pipeline(timer, "simple_rag")
+                    await self._maybe_extract_skill(response, query)
+                    if trace:
+                        trace_manager.end_trace(trace.trace_id)
                     return response
                 except RouteEscalationException as e:
-                    # 携因打回: 将失败原因注入 MDT
                     logger.warning(f"置信度不足，升级至 MDT: {e.reason}")
+                    if trace:
+                        trace.add_event("escalation_to_mdt", {"reason": e.reason})
                     await self._store_reflection(query.query, e.reason)
-                    return await self._run_mdt(
+                    result = await self._run_mdt(
                         query, profile,
                         departments=decision.departments or self._infer_departments(query.query),
                         escalation_reason=e.reason,
+                        skill_hints=skill_hints,
                     )
+                    await self._log_pipeline(timer, "mdt_escalated")
+                    if trace:
+                        trace_manager.end_trace(trace.trace_id)
+                    return result
             else:
-                # MDT 路径
-                return await self._run_mdt(
+                result = await self._run_mdt(
                     query, profile,
                     departments=decision.departments,
+                    skill_hints=skill_hints,
                 )
+                await self._log_pipeline(timer, "mdt")
+                await self._maybe_extract_skill(result, query)
+                if trace:
+                    trace_manager.end_trace(trace.trace_id)
+                return result
 
         except InsufficientInformationException:
-            # ---- CoT 安全退避 ----
-            # 设计文档: "切断 ReAct 循环，禁止发散推理，走硬编码的保守策略链路"
+            if trace:
+                trace.end_span(trace._roots[0].span_id if trace._roots else "", status="fallback")
+                trace_manager.end_trace(trace.trace_id)
             logger.warning("信息不足异常: CoT 安全退避")
             return MedicalResponse(
                 answer=SAFE_FALLBACK_RESPONSE,
@@ -206,13 +300,23 @@ class MedicalOrchestrator:
                 is_safe_fallback=True,
             )
         except Exception as e:
-            # 医疗系统不能 Crash: 所有异常必须有兜底处理
+            if trace:
+                trace.end_span(trace._roots[0].span_id if trace._roots else "", status="error",
+                               metadata={"error": str(e)})
+                trace_manager.end_trace(trace.trace_id)
             logger.error(f"系统异常: {e}", exc_info=True)
             return MedicalResponse(
                 answer="抱歉，系统处理过程中出现异常，请稍后重试或建议线下就医。",
                 route_path="error",
                 confidence=0.0,
             )
+
+    async def _log_pipeline(self, timer: PipelineTimer, path: str):
+        logger.info(
+            f"Pipeline [{path}]: profile={timer.get('profile_update'):.0f}ms, "
+            f"precheck={timer.get('cot_precheck'):.0f}ms, "
+            f"routing={timer.get('routing'):.0f}ms, total={timer.total_ms:.0f}ms"
+        )
 
     async def _route_async(self, query: str, profile: PatientProfile):
         """异步动态路由: 规则拦截（快车道）→ LLM路由（慢车道）"""
@@ -225,10 +329,10 @@ class MedicalOrchestrator:
         profile_summary = f"疾病:{profile.diseases} 用药:{profile.medications} 过敏:{profile.allergies}"
         return await self.llm_router.route(query, profile_summary)
 
-    async def _run_simple_rag(self, query: MedicalQuery, profile: PatientProfile):
+    async def _run_simple_rag(self, query: MedicalQuery, profile: PatientProfile, skill_hints: str = ""):
         """执行简单 RAG"""
         workflow = SimpleRAGWorkflow(self.llm, self.retriever, self.reranker, self.reflection)
-        return await workflow.run(query, profile)
+        return await workflow.run(query, profile, skill_hints=skill_hints)
 
     async def _run_mdt(
         self,
@@ -236,12 +340,13 @@ class MedicalOrchestrator:
         profile: PatientProfile,
         departments: list[str],
         escalation_reason: str = "",
+        skill_hints: str = "",
     ):
         """执行 MDT 会诊（含共识引导检索）+ Decision Maker 评估"""
         workflow = MDTConsultationWorkflow(
             self.llm, self.reflection, self.retriever, self.reranker, profile
         )
-        response = await workflow.run(query, departments, escalation_reason)
+        response = await workflow.run(query, departments, escalation_reason, skill_hints=skill_hints)
 
         # ---- Decision Maker 安全阀评估（基于证据验证后的共识） ----
         try:
@@ -332,3 +437,23 @@ class MedicalOrchestrator:
             await self.reflection.generate_and_store(query, reason)
         except Exception as e:
             logger.error(f"反思存储失败: {e}")
+
+    async def _maybe_extract_skill(self, response: MedicalResponse, query: MedicalQuery):
+        """从成功回答中提取技能（Agent 自进化）"""
+        if not self.skill_manager or not cfg.skill.extraction_enabled:
+            return
+        if response.is_safe_fallback or response.route_path in ("error", "retrieval_only"):
+            return
+        if response.confidence < cfg.skill.min_confidence_for_extraction:
+            return
+        try:
+            skill = await self.skill_manager.extract_from_success(
+                query=query.query,
+                answer=response.answer,
+                route_path=response.route_path,
+                departments=response.departments,
+            )
+            if skill:
+                await self.skill_manager.store(skill)
+        except Exception as e:
+            logger.debug(f"技能提取失败: {e}")

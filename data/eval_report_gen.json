@@ -1,0 +1,15 @@
+{
+  "total_queries": 3,
+  "retrieval": {
+    "mrr": 0.0,
+    "hit@1": 0.0,
+    "hit@3": 0.0,
+    "hit@5": 0.0,
+    "hit@10": 0.0
+  },
+  "generation": {
+    "accuracy": 0.6667,
+    "correct": 2,
+    "total": 3
+  }
+}

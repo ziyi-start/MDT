@@ -31,6 +31,7 @@ milvus:
     kb: "Medical_KB"                       # 医学知识库集合名
     profile: "Patient_Profile"             # 患者画像集合名
     reflection: "Reflection_Mem"           # 反思记忆集合名
+    skill: "Skill_Mem"                     # 技能记忆集合名（Agent 自进化）
   index:
     type: "IVF_FLAT"                       # 索引类型
     metric_type: "COSINE"                  # 度量类型
@@ -80,6 +81,16 @@ reflection:
   in_memory_overlap_ratio: 0.3             # 内存模式关键词重叠度阈值
   in_memory_min_terms: 2                   # 内存模式最小重叠词数
 
+# ---- Agent 自进化 ----
+# 从成功回答中提取可复用技能 (Skill)，与 Reflection (失败教训) 互补
+skill:
+  search_threshold: 0.6                    # 技能检索相似度阈值
+  similarity_threshold: 0.75               # 新旧技能冲突检测阈值（高于此值触发 merge/discard）
+  max_in_memory: 100                       # 内存技能存储上限
+  max_return: 3                            # 检索最多返回技能数
+  extraction_enabled: true                 # 是否启用技能提取
+  min_confidence_for_extraction: 0.7       # 只有置信度高于此值的回答才提取技能
+
 # ---- 外部服务 ----
 services:
   ner_url: ""                              # NER 服务地址（BERT-CRF）
@@ -92,6 +103,33 @@ server:
   port: 8000
   reload: false                            # 开发模式自动重载（设为 true 时日志文件需排除在监控外）
   app_version: "1.0.0"
+
+# ---- Harness 工程配置 ----
+# Agent = Model + Harness — 模型外的工程外壳
+# 参考: Harness Engineering (OpenAI), Agent Harness 综述 (EleutherAI)
+harness:
+  # ---- 追踪观测 ----
+  tracing:
+    enabled: true                            # 是否启用 TraceID 传播
+    max_completed_traces: 1000               # 保留的最大已完成追踪数
+
+  # ---- 评估 ----
+  evaluator:
+    enabled: true                            # 是否启用在线评估
+    baseline_path: ""                        # 基线评估报告路径（用于 regression 检测）
+
+  # ---- 安全守卫 ----
+  safety:
+    rate_limit_max_calls: 20                 # 工具调用速率限制 (次/窗口)
+    rate_limit_window_sec: 60                # 限流时间窗口 (秒)
+    cost_tracking_enabled: true              # 是否启用成本追踪
+
+  # ---- 上下文预算 ----
+  context:
+    permanent_tokens: 2000                   # 永久层 Token 预算（系统提示、核心约束）
+    working_tokens: 4000                     # 工作层 Token 预算（对话历史）
+    deep_tokens: 8000                        # 深度层 Token 预算（检索结果）
+    total_tokens: 14000                      # 总 Token 预算上限
 
 # ---- 通用 ----
 default_user_id: "default_user"            # 默认用户 ID
