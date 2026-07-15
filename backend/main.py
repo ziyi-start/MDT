@@ -498,10 +498,10 @@ async def context_snapshot():
 
 @app.post("/api/query/stream")
 async def query_stream(req: QueryRequest):
-    """流式查询 — SSE 协议，带心跳保活
+    """流式查询 — 真正的 token 级 SSE 流式输出
 
-    每个事件格式: data: {"type":"content"|"status"|"done"|"error", "text":"..."}
-    长时间处理期间每秒发送 heartbeat 防止超时断开。
+    使用 orchestrator.process_stream() 直接 yield LLM 逐 token 生成，
+    检索/路由阶段发送 status 事件，LLM 生成阶段发送 content 事件。
     """
     import json as _json
 
@@ -510,51 +510,13 @@ async def query_stream(req: QueryRequest):
             yield f"data: {_json.dumps({'type': 'error', 'text': 'System not initialized'})}\n\n"
             return
 
-        stop_heartbeat = False
-
-        async def heartbeat():
-            while not stop_heartbeat:
-                await asyncio.sleep(1)
-                if not stop_heartbeat:
-                    yield f"data: {_json.dumps({'type': 'status', 'text': '处理中...'})}\n\n"
-
-        yield f"data: {_json.dumps({'type': 'status', 'text': '开始处理查询...'})}\n\n"
-
         medical_q = MedicalQuery(query=req.query, user_id=req.user_id)
-
         try:
-            async def run_process():
-                return await orchestrator.process(medical_q)
-
-            process_task = asyncio.create_task(run_process())
-
-            last_status = ""
-            while not process_task.done():
-                snap = orchestrator.context_manager.snapshot() if orchestrator.context_manager else {}
-                status = f"路由中... (memories={snap.get('memories', {}).get('working_count', 0)})"
-                if status != last_status:
-                    last_status = status
-                    yield f"data: {_json.dumps({'type': 'status', 'text': status})}\n\n"
-                await asyncio.sleep(2)
-
-            response = process_task.result()
-            stop_heartbeat = True
-
-            yield f"data: {_json.dumps({'type': 'status', 'text': f'路由: {response.route_path}, 置信度: {response.confidence}'})}\n\n"
-
-            answer = response.answer or ""
-            chunk_size = 80
-            for i in range(0, len(answer), chunk_size):
-                chunk = answer[i:i + chunk_size]
-                yield f"data: {_json.dumps({'type': 'content', 'text': chunk})}\n\n"
-                await asyncio.sleep(0.02)
-
-            yield f"data: {_json.dumps({'type': 'done', 'text': answer, 'route_path': response.route_path, 'confidence': response.confidence, 'departments': response.departments, 'sources': response.sources})}\n\n"
-
+            async for chunk in orchestrator.process_stream(medical_q):
+                yield f"data: {_json.dumps(chunk, ensure_ascii=False)}\n\n"
         except Exception as e:
-            stop_heartbeat = True
             logger.error(f"Stream query error: {e}")
-            yield f"data: {_json.dumps({'type': 'error', 'text': str(e)})}\n\n"
+            yield f"data: {_json.dumps({'type': 'error', 'text': str(e)}, ensure_ascii=False)}\n\n"
 
     return StreamingResponse(
         generate(),

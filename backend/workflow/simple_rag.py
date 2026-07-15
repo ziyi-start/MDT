@@ -3,10 +3,16 @@
 设计文档: Simple RAG 分支
 流程: 反思拦截 → 混合检索 → 重排去噪 → LLM 生成（带引用）
 末尾由编排器执行置信度评估，不通过则升级到 MDT。
+
+支持两种模式:
+- run(): 完整执行，返回 (response, docs)
+- run_stream(): 流式执行，yield SSE chunks (content + done)
 """
 from __future__ import annotations
 
+import json
 import logging
+from typing import AsyncIterator
 
 from schema.models import MedicalQuery, MedicalResponse, DocumentChunk, PatientProfile
 from llm.client import AsyncLLMClient
@@ -102,3 +108,76 @@ class SimpleRAGWorkflow:
         )
 
         return response, reranked
+
+    async def run_stream(
+        self, query: MedicalQuery, profile: PatientProfile | None = None,
+        skill_hints: str = "",
+    ) -> AsyncIterator[dict]:
+        """流式执行 Simple RAG — 检索+重排后，用 chat_stream 逐 token 输出
+
+        yield 格式: {"type":"status"|"content"|"done"|"error", "text":..., ...}
+        """
+        yield {"type": "status", "text": "反思拦截中..."}
+        reflection_hint = ""
+        if self.reflection:
+            try:
+                hint = await self.reflection.search_reflection(query.query)
+                if hint:
+                    reflection_hint = hint
+                    yield {"type": "status", "text": f"命中反思记忆: {hint[:40]}..."}
+            except Exception:
+                pass
+
+        yield {"type": "status", "text": "检索中..."}
+        documents = await self.retriever.retrieve(
+            query=query.query, profile=profile, top_k=cfg.retrieval.top_k,
+        )
+
+        yield {"type": "status", "text": f"检索完成({len(documents)}篇)，重排中..."}
+        reranked = await self.reranker.rerank(query.query, documents, top_k=cfg.retrieval.rerank_top_k)
+
+        if not reranked or self.reranker.is_insufficient(reranked):
+            max_score = reranked[0].score if reranked else 0
+            yield {"type": "error", "text": f"知识库无可靠相关知识 (最高分 {max_score:.3f})"}
+            return
+
+        context = "\n\n".join(
+            f"[Source: Doc {i+1}] {doc.content}" for i, doc in enumerate(reranked)
+        )
+
+        system_prompt = SIMPLE_RAG_SYSTEM_PROMPT
+        if reflection_hint:
+            system_prompt += f"\n\n{reflection_hint}"
+        if skill_hints:
+            system_prompt += f"\n\n{skill_hints}"
+
+        yield {"type": "status", "text": "LLM 生成中..."}
+        collected = []
+        try:
+            async for chunk in self.llm.chat_stream(
+                messages=[
+                    Message(role="system", content=system_prompt),
+                    Message(role="user", content=f"参考文献：\n{context}\n\n问题：{query.query}"),
+                ],
+            ):
+                if chunk["type"] == "content":
+                    collected.append(chunk["text"])
+                    yield {"type": "content", "text": chunk["text"]}
+        except Exception as e:
+            if not collected:
+                yield {"type": "error", "text": f"LLM 生成失败: {e}"}
+                return
+
+        full_text = "".join(collected)
+        sources = [doc.source for doc in reranked if doc.source]
+        yield {
+            "type": "done",
+            "text": full_text,
+            "route_path": "simple_rag",
+            "confidence": 1.0,
+            "sources": sources,
+            "documents": [
+                {"content": d.content, "source": d.source, "score": d.score}
+                for d in reranked
+            ],
+        }

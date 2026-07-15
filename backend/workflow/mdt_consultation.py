@@ -10,11 +10,17 @@
 
 CoT 安全退避:
 - 检索阶段若 Reranker 最高分低于极低阈值 → 触发 InsufficientInformationException
+
+支持两种模式:
+- run(): 完整执行
+- run_stream(): 流式执行，yield SSE chunks
 """
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+from typing import AsyncIterator
 
 from schema.models import MedicalQuery, MedicalResponse, PatientProfile
 from llm.client import AsyncLLMClient
@@ -206,6 +212,126 @@ class MDTConsultationWorkflow:
 
         logger.info("MDT 会诊完成")
         return response
+
+    async def run_stream(
+        self,
+        query: MedicalQuery,
+        departments: list[str],
+        escalation_reason: str = "",
+        skill_hints: str = "",
+    ) -> AsyncIterator[dict]:
+        """流式执行 MDT 会诊 — 专家并发后，共识+验证逐 token 输出"""
+        yield {"type": "status", "text": f"招募专家: {', '.join(departments)}"}
+
+        reflection_hint = ""
+        try:
+            hint = await self.reflection.search_reflection(query.query)
+            if hint:
+                reflection_hint = hint
+                yield {"type": "status", "text": f"命中反思记忆"}
+        except Exception:
+            pass
+
+        # 3. 创建专家
+        experts = []
+        for dept in departments:
+            system_prompt = EXPERT_SYSTEM_PROMPT.format(department=dept, reflection_hint=reflection_hint)
+            if skill_hints:
+                system_prompt += f"\n\n{skill_hints}"
+            if self.profile:
+                system_prompt += f"\n\n患者画像：疾病={self.profile.diseases}, 用药={self.profile.medications}, 过敏={self.profile.allergies}"
+            if escalation_reason:
+                system_prompt += f"\n\n注意：此前简单检索未能给出可靠回答，原因：{escalation_reason}。请特别注意此问题。"
+            expert = ReactEngine(llm_client=self.llm, tool_registry=global_tool_registry, system_prompt=system_prompt)
+            experts.append((dept, expert))
+
+        # 4. 并发会诊
+        yield {"type": "status", "text": f"{len(experts)} 位专家并发推理中..."}
+        tasks = [self._run_expert(dept, expert, query.query) for dept, expert in experts]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        successful_opinions = []
+        failed_departments = []
+        for (dept, _), result in zip(experts, results):
+            if isinstance(result, Exception):
+                failed_departments.append(dept)
+            else:
+                successful_opinions.append(f"[{dept}]\n{result}")
+
+        if not successful_opinions:
+            yield {"type": "error", "text": "所有专家均会诊失败，触发安全退避"}
+            return
+
+        yield {"type": "status", "text": f"{len(successful_opinions)}/{len(experts)} 专家完成，共识提炼中..."}
+
+        # 5. 共识提炼 — 流式输出
+        profile_text = ""
+        if self.profile:
+            profile_text = f"疾病={self.profile.diseases}, 用药={self.profile.medications}, 过敏={self.profile.allergies}"
+        consensus_prompt = CONSENSUS_PROMPT.format(
+            expert_opinions="\n\n".join(successful_opinions),
+            profile=profile_text or "无",
+        )
+
+        collected = []
+        async for chunk in self.llm.chat_stream(
+            messages=[Message(role="user", content=consensus_prompt)],
+            temperature=cfg.llm.temperatures["consensus"],
+        ):
+            if chunk["type"] == "content":
+                collected.append(chunk["text"])
+                yield {"type": "content", "text": chunk["text"]}
+
+        consensus_text = "".join(collected)
+
+        # 6. 共识引导检索 + 验证
+        sources = []
+        try:
+            yield {"type": "status", "text": "共识验证中..."}
+            consensus_docs = await self.retriever.retrieve(
+                consensus_text, profile=self.profile, top_k=cfg.retrieval.consensus_retrieval_top_k,
+            )
+            if consensus_docs:
+                reranked = await self.reranker.rerank(consensus_text, consensus_docs, top_k=cfg.retrieval.consensus_rerank_top_k)
+                if reranked:
+                    evidence_lines = []
+                    for doc in reranked:
+                        evidence_lines.append(f"[{len(evidence_lines) + 1}] {doc.content}")
+                        if doc.source:
+                            sources.append(doc.source)
+                    evidence_text = "\n".join(evidence_lines)
+                    profile_text_v = ""
+                    if self.profile:
+                        profile_text_v = f"疾病={self.profile.diseases}, 用药={self.profile.medications}, 过敏={self.profile.allergies}"
+                    verify_prompt = CONSENSUS_VERIFICATION_PROMPT.format(
+                        consensus=consensus_text, evidence=evidence_text, profile=profile_text_v or "无",
+                    )
+                    yield {"type": "status", "text": "证据验证中..."}
+                    verified = []
+                    async for chunk in self.llm.chat_stream(
+                        messages=[Message(role="user", content=verify_prompt)],
+                        temperature=cfg.llm.temperatures["consensus"],
+                    ):
+                        if chunk["type"] == "content":
+                            verified.append(chunk["text"])
+                            yield {"type": "content", "text": chunk["text"]}
+                    final_answer = "".join(verified) or consensus_text
+                else:
+                    final_answer = consensus_text
+            else:
+                final_answer = consensus_text
+        except Exception as e:
+            logger.warning(f"共识引导检索失败: {e}")
+            final_answer = consensus_text + "\n\n注意：此结论的检索验证步骤失败，建议谨慎参考。"
+
+        yield {
+            "type": "done",
+            "text": final_answer,
+            "route_path": "mdt",
+            "departments": departments,
+            "confidence": 1.0,
+            "sources": sources,
+        }
 
     async def _run_expert(self, department: str, engine: ReactEngine, query: str) -> str:
         """运行单个专家的 ReAct 循环"""

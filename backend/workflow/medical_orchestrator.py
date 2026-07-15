@@ -25,8 +25,9 @@ from __future__ import annotations
 import json
 import logging
 import time
+from typing import AsyncIterator
 
-from schema.models import MedicalQuery, MedicalResponse, PatientProfile, RouteDecision
+from schema.models import MedicalQuery, MedicalResponse, PatientProfile, RouteDecision, DocumentChunk
 from llm.client import AsyncLLMClient
 from llm.prompt_templates import SAFE_FALLBACK_RESPONSE, DECISION_MAKER_PROMPT
 from router.rule_interceptor import RuleInterceptor
@@ -588,3 +589,145 @@ class MedicalOrchestrator:
                 await self.skill_manager.store(skill)
         except Exception as e:
             logger.debug(f"技能提取失败: {e}")
+
+    async def process_stream(self, query: MedicalQuery) -> AsyncIterator[dict]:
+        """流式处理 — 使用 chat_stream 实现真正的 token 级流式输出
+
+        yield 格式: {"type":"status"|"content"|"done"|"error", ...}
+        """
+        start_time = time.time()
+        yield {"type": "status", "text": "开始处理查询..."}
+
+        # Run-level 隔离
+        run_ctx = self.run_memory.begin_run(
+            session_id=getattr(self.context_manager, 'session_id', ''),
+            user_id=query.user_id,
+        )
+        self.event_memory.ingest(
+            f"用户查询: {query.query}", event_type=EventType.SYMPTOM_ANALYSIS, metadata={"user_id": query.user_id},
+        )
+
+        if self.context_manager:
+            if not self.context_manager._session_started:
+                self.context_manager.begin_session()
+            self.context_manager.set_system_prompt("你是一个医疗知识助手，只基于检索到的文献回答。禁止编造。", importance=1.0)
+
+        llm_available = getattr(self.llm, '_api_key_configured', True)
+
+        # Image update
+        from tools.literature_search import set_current_profile
+        if llm_available:
+            yield {"type": "status", "text": "更新患者画像..."}
+            profile = await self.profile_extractor.extract_and_update(query.user_id, query.query)
+        else:
+            profile = self.profile_extractor.get_profile(query.user_id)
+        set_current_profile(profile)
+        if self.context_manager and profile:
+            self.context_manager.inject_profile(f"疾病={profile.diseases}, 用药={profile.medications}, 过敏={profile.allergies}")
+
+        # Precheck
+        quick_docs = await self.retriever.retrieve(query.query, profile=profile, top_k=cfg.retrieval.quick_check_top_k)
+        if not quick_docs:
+            yield {"type": "status", "text": "CoT 安全退避: 检索为空"}
+            self.event_memory.ingest("CoT安全退避", event_type=EventType.SAFETY_CHECK)
+            yield {
+                "type": "done",
+                "text": "抱歉，缺乏权威文献支撑，强烈建议线下就医。",
+                "route_path": "safe_fallback",
+                "confidence": 0.0,
+                "sources": [],
+            }
+            self._finalize_run(run_ctx, MedicalResponse(answer="", route_path="safe_fallback", confidence=0.0))
+            return
+
+        # Skills
+        skill_hints = ""
+        if self.skill_manager and cfg.skill.extraction_enabled:
+            try:
+                skills = await self.skill_manager.search_skills(query.query)
+                if skills:
+                    skill_hints = "\n参考既往成功经验：\n" + "\n".join(f"[技能] {s.intent}: {s.action}" for s in skills)
+                    self.event_memory.ingest(f"技能命中: {len(skills)} 条", event_type=EventType.SAFETY_CHECK)
+            except Exception:
+                pass
+
+        # Route
+        if llm_available:
+            decision = await self._route_async(query.query, profile)
+            yield {"type": "status", "text": f"路由: {decision.route_path}"}
+        else:
+            decision = self.rule_interceptor.intercept(query.query)
+            if decision is None:
+                decision = RouteDecision(route_path="simple_rag", departments=[])
+
+        if not llm_available:
+            yield {"type": "error", "text": "LLM 不可用"}
+            return
+
+        # Execute based on route
+        if decision.route_path == "simple_rag":
+            run_ctx.route_path = "simple_rag"
+            self.event_memory.ingest("Simple RAG 流式执行", event_type=EventType.LITERATURE_SEARCH)
+
+            wf = SimpleRAGWorkflow(self.llm, self.retriever, self.reranker, self.reflection)
+            full_text = ""
+            async for chunk in wf.run_stream(query, profile, skill_hints=skill_hints):
+                if chunk["type"] == "content":
+                    full_text += chunk["text"]
+                elif chunk["type"] == "done":
+                    full_text = chunk.get("text", full_text)
+                    # Post-process: add metadata
+                    docs_data = chunk.get("documents", [])
+                    run_ctx.cache_retrieval(query.query, [
+                        DocumentChunk(doc_id=f"stream_{i}", content=d["content"], source=d.get("source",""), score=d.get("score",0))
+                        for i, d in enumerate(docs_data)
+                    ])
+                    _sources = chunk.get("sources", [])
+                    chunk["confidence"] = 1.0
+                    if self.context_manager:
+                        self.context_manager.add_conversation(
+                            query=query.query, response=full_text, route_path="simple_rag", confidence=1.0,
+                        )
+                    self._finalize_run(run_ctx, MedicalResponse(answer=full_text, route_path="simple_rag", sources=_sources, confidence=1.0))
+                yield chunk
+
+            # 技能提取
+            await self._maybe_extract_skill(
+                MedicalResponse(answer=full_text, route_path="simple_rag", sources=chunk.get("sources", [])),
+                query,
+            )
+
+        else:
+            run_ctx.route_path = "mdt"
+            run_ctx.departments = decision.departments
+            self.event_memory.ingest(f"MDT 流式会诊: 科室={decision.departments}", event_type=EventType.CONSENSUS_FORMATION)
+
+            wf = MDTConsultationWorkflow(self.llm, self.reflection, self.retriever, self.reranker, profile)
+            full_text = ""
+            async for chunk in wf.run_stream(
+                query, departments=decision.departments,
+                escalation_reason="", skill_hints=skill_hints,
+            ):
+                if chunk["type"] == "content":
+                    full_text += chunk["text"]
+                elif chunk["type"] == "done":
+                    full_text = chunk.get("text", full_text)
+                    if self.context_manager:
+                        self.context_manager.add_conversation(
+                            query=query.query, response=full_text, route_path="mdt",
+                            confidence=1.0, departments=decision.departments,
+                        )
+                    self._finalize_run(
+                        run_ctx,
+                        MedicalResponse(answer=full_text, route_path="mdt", departments=decision.departments, sources=chunk.get("sources", []), confidence=1.0),
+                    )
+                yield chunk
+
+            # 技能提取
+            await self._maybe_extract_skill(
+                MedicalResponse(answer=full_text, route_path="mdt", departments=decision.departments, sources=chunk.get("sources", [])),
+                query,
+            )
+
+        elapsed = time.time() - start_time
+        self.event_memory.ingest(f"流式处理完成 ({elapsed:.0f}s)", event_type=EventType.DECISION)
