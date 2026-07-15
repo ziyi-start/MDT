@@ -40,7 +40,7 @@ from memory.reflection_manager import ReflectionManager
 from memory.skill_manager import SkillManager
 from workflow.medical_orchestrator import MedicalOrchestrator
 from tools.literature_search import set_retriever
-from schema.models import MedicalQuery
+from schema.models import MedicalQuery, MedicalResponse
 from monitoring.metrics import SessionMetrics, RequestMetrics
 
 # 用户反馈存储
@@ -433,7 +433,6 @@ async def submit_feedback(
     # 高评分反馈可触发技能强化
     if rating >= 0.8 and orchestrator and orchestrator.skill_manager:
         try:
-from schema.models import MedicalQuery, MedicalResponse
             mq = MedicalQuery(query=query, user_id=cfg.default_user_id)
             await orchestrator._maybe_extract_skill(
                 MedicalResponse(
