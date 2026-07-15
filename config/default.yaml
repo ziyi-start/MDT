@@ -19,6 +19,7 @@ llm:
     confidence_check: 0.1                  # 置信度校验
     reflection: 0.1                        # 反思生成
     profile_extraction: 0.1                # 画像抽取
+    skill_extraction: 0.1                  # 技能提取（Agent 自进化）
     decision_maker: 0.1                    # 决策器
     consensus: 0.3                         # 共识提炼
 
@@ -124,12 +125,49 @@ harness:
     rate_limit_window_sec: 60                # 限流时间窗口 (秒)
     cost_tracking_enabled: true              # 是否启用成本追踪
 
-  # ---- 上下文预算 ----
+  # ---- 上下文预算与记忆管理 ----
+  # 参考: MemGPT 记忆层级 + Harness 上下文预算 + LangChain SessionMemory
   context:
-    permanent_tokens: 2000                   # 永久层 Token 预算（系统提示、核心约束）
-    working_tokens: 4000                     # 工作层 Token 预算（对话历史）
-    deep_tokens: 8000                        # 深度层 Token 预算（检索结果）
-    total_tokens: 14000                      # 总 Token 预算上限
+    # 四层记忆容量 (L0-L3)
+    permanent_tokens: 2000                   # L0 Working Memory: 系统提示、核心约束
+    working_tokens: 4000                     # L1 Short-Term: 对话历史滑动窗口
+    deep_tokens: 8000                        # L2 Long-Term: 持久化记忆 (技能+反思)
+    total_tokens: 14000                      # L3 External: 外部知识库检索结果
+    # 短期记忆滑动窗口
+    short_term_window_size: 20               # 最近 N 条消息保留在窗口中
+    importance_threshold: 0.5                # 重要性阈值（低于此值的低优先级消息优先逐出）
+    recency_decay_rate: 0.1                  # 时间衰减率（每小时衰减权重）
+    # 多轮对话管理
+    max_turns: 20                            # 最多保留轮数
+    max_history_tokens: 4000                 # 历史对话最大 token 数
+    summary_threshold_turns: 6               # 超过此轮数触发历史摘要压缩
+    topic_drift_threshold: 0.3               # 话题漂移检测阈值
+    context_penetration_ratio: 0.1           # 上下文穿透项占预算比例
+    # 上下文窗口调度
+    warning_threshold: 0.75                  # 预算警告线（75% 时发出警告）
+    critical_threshold: 0.90                 # 预算危险线（90% 时触发压缩）
+    dedup_enabled: true                      # 是否启用内容去重
+    compression_enabled: true                # 是否启用上下文压缩
+    compression_summary_ratio: 0.3           # 压缩摘要保留比例
+    response_reserved_tokens: 2048           # 为 LLM 响应预留的 token 数
+    # 内容感知压缩 (Content-aware Compaction)
+    compaction_llm_enabled: true             # 是否启用 LLM-guided 压缩
+    compaction_max_tokens: 2000              # 压缩后最大 token 数
+    # 事件记忆 (Event Memory)
+    surprise_threshold: 1.5                  # Bayesian surprise 事件分割阈值
+    max_events_per_session: 100              # 每个会话最大事件数
+    temporal_retrieval_window: 3             # 时间邻接检索窗口数
 
 # ---- 通用 ----
 default_user_id: "default_user"            # 默认用户 ID
+
+# ---- MCP (Model Context Protocol) 外部工具集成 ----
+mcp:
+  enabled: false                           # 是否启用 MCP
+  servers: []                              # MCP Server 列表
+  # 示例:
+  # - name: "pubmed"
+  #   command: "python"
+  #   args: ["mcp_servers/pubmed_server.py"]
+  # - name: "drug_db"
+  #   url: "http://localhost:3001"

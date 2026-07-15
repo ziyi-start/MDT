@@ -10,7 +10,13 @@ Harness 增强 (Agent = Model + Harness):
 5. 追踪观测层: TraceID 传播 + Span 记录 + 执行图
 6. 评估层: 7维确定性评分 + 基线对比
 7. 安全守卫层: 工具调用验证 + 限流 + 成本追踪
-8. 上下文预算层: 分层加载 + Token 预算管理
+8. 上下文管理层: 四层记忆层级 + 多轮对话 + 上下文窗口调度 + 智能组装
+
+上下文架构 (v2.0):
+  L0 Working Memory  — 系统提示、核心约束 (~2K tokens, 始终在线)
+  L1 Short-Term Memory — 对话历史滑动窗口 (~4K tokens, 时间/重要性管理)
+  L2 Long-Term Memory  — 持久化技能+反思 (~8K tokens, 按需检索注入)
+  L3 External Memory   — 检索结果+外部知识 (~8K tokens, 按需加载)
 
 完整闭环: 查询 → 画像更新 → 路由 → 执行 → 共识引导检索 → 评估 → (升级/退避/输出)
 """
@@ -37,6 +43,7 @@ from monitoring.metrics import PipelineTimer
 from monitoring.tracing import TraceContext, trace_manager
 from schema.messages import Message
 from config import cfg
+from memory.event_memory import EventType
 
 logger = logging.getLogger(__name__)
 
@@ -110,7 +117,7 @@ class MedicalOrchestrator:
     Harness 增强:
     9. 追踪观测: TraceID 贯穿全流程 + Span 阶段计时 + 执行图
     10. 安全守卫: 工具调用验证 + 限流 + 成本追踪
-    11. 上下文预算: 分层加载 + Token 预算管理
+    11. 上下文管理: 四层记忆 + 多轮对话 + 上下文窗口调度 + 智能组装
     12. 在线评估: 7维确定性评分
     """
 
@@ -151,10 +158,48 @@ class MedicalOrchestrator:
         self.context_manager = context_manager
         self.harness_evaluator = harness_evaluator
 
+        # ---- Run-level 记忆隔离 ----
+        from context.run_memory import RunMemoryManager
+        self.run_memory = RunMemoryManager()
+
+        # ---- 事件驱动的情节记忆 ----
+        from memory.event_memory import EventMemory
+        self.event_memory = EventMemory()
+
+        # ---- Agent 自主记忆工具: 注入 ContextManager 引用 ----
+        from tools.memory_tools import set_context_manager
+        set_context_manager(context_manager)
+
     async def process(self, query: MedicalQuery) -> MedicalResponse:
         """处理用户查询 - 主入口"""
         start_time = time.time()
         logger.info(f"开始处理查询: '{query.query}' (user={query.user_id})")
+
+        # ---- Run-level 隔离: 开始新 Run ----
+        run_ctx = self.run_memory.begin_run(
+            session_id=getattr(self.context_manager, 'session_id', ''),
+            user_id=query.user_id,
+        )
+
+        # ---- 事件记忆: 摄取用户查询为第一个事件 ----
+        self.event_memory.ingest(
+            f"用户查询: {query.query}",
+            event_type=EventType.SYMPTOM_ANALYSIS,
+            metadata={"user_id": query.user_id},
+        )
+
+        # ---- Harness: 上下文管理器初始化 ----
+        if self.context_manager:
+            if not self.context_manager._session_started:
+                self.context_manager.begin_session()
+            self.context_manager.set_system_prompt(
+                "你是一个医疗知识助手，只基于检索到的文献回答。禁止编造。",
+                importance=1.0,
+            )
+            self.context_manager.append_system_prompt(
+                "安全约束: 无法回答时建议线下就医，不可冒险推测。",
+                importance=0.9,
+            )
 
         # ---- Harness: 创建追踪上下文 ----
         trace = None
@@ -173,7 +218,7 @@ class MedicalOrchestrator:
             # ---- Step 1: 渐进式画像更新 ----
             timer = PipelineTimer()
             if trace:
-                trace.begin_span("profile_update", parent=trace._roots[0].span_id if trace._roots else None)
+                trace.begin_span("profile_update", parent_id=trace._roots[0].span_id if trace._roots else None)
             # 将画像注入到工具模块，使 Agent 在 ReAct 循环中调用检索时也能享受画像约束
             from tools.literature_search import set_current_profile
             # LLM 可用时才做画像抽取（需要调用 LLM），否则使用空画像
@@ -187,6 +232,13 @@ class MedicalOrchestrator:
 
             # 注入画像到工具模块，使 Agent 调用 literature_search 时自动携带画像约束
             set_current_profile(profile)
+
+            # ---- Harness 上下文: 注入患者画像到穿透项 ----
+            if self.context_manager and profile:
+                self.context_manager.inject_profile(
+                    f"疾病={profile.diseases}, 用药={profile.medications}, 过敏={profile.allergies}"
+                )
+
             if trace:
                 trace.end_span(trace._stack[-1].span_id if trace._stack else "")
 
@@ -218,9 +270,14 @@ class MedicalOrchestrator:
                     if skills:
                         skill_lines = []
                         for s in skills:
-                            skill_lines.append(f"[技能] {s.intent}: {s.action}")
+                            hint = f"{s.intent}: {s.action}"
+                            skill_lines.append(f"[技能] {hint}")
+                            if self.context_manager:
+                                self.context_manager.inject_skill(hint)
                         skill_hints = "\n参考既往成功经验：\n" + "\n".join(skill_lines)
                         logger.info(f"技能命中: {len(skills)} 条")
+                        # 事件记忆: 技能命中
+                        self.event_memory.ingest(f"技能命中: {len(skills)} 条", event_type=EventType.SAFETY_CHECK)
                 except Exception as e:
                     logger.debug(f"技能检索失败: {e}")
 
@@ -240,14 +297,28 @@ class MedicalOrchestrator:
 
             # ---- Step 4: 执行工作流 ----
             if not llm_available:
-                return await self._retrieval_only_response(query, profile, decision)
+                response = await self._retrieval_only_response(query, profile, decision)
+                self.event_memory.ingest("LLM不可用，纯检索模式", event_type=EventType.DECISION)
+                self._finalize_run(run_ctx, response)
+                return response
 
             if decision.route_path == "simple_rag":
                 if trace:
                     trace.begin_span("execute_simple_rag")
+                # 事件记忆: Simple RAG 执行
+                self.event_memory.ingest("Simple RAG 检索开始", event_type=EventType.LITERATURE_SEARCH)
                 response, docs = await self._run_simple_rag(query, profile, skill_hints=skill_hints)
                 if trace:
                     trace.end_span(trace._stack[-1].span_id if trace._stack else "")
+                # 事件记忆: 检索结果
+                self.event_memory.ingest(
+                    f"Simple RAG 检索返回 {len(docs)} 篇文献，信心={response.confidence}",
+                    event_type=EventType.LITERATURE_SEARCH,
+                    metadata={"source_count": len(docs), "confidence": response.confidence},
+                )
+                # Run 产物: 缓存检索结果
+                run_ctx.cache_retrieval(query.query, docs)
+                run_ctx.route_path = "simple_rag"
 
                 # ---- Step 5: 置信度评估 → 可能升级到 MDT ----
                 try:
@@ -258,14 +329,29 @@ class MedicalOrchestrator:
                         trace.end_span(trace._stack[-1].span_id if trace._stack else "")
                     await self._log_pipeline(timer, "simple_rag")
                     await self._maybe_extract_skill(response, query)
+                    # ---- 上下文: 记录多轮对话 ----
+                    if self.context_manager:
+                        self.context_manager.add_conversation(
+                            query=query.query,
+                            response=response.answer,
+                            route_path="simple_rag",
+                            confidence=response.confidence,
+                        )
+                    self._finalize_run(run_ctx, response, context_manager=self.context_manager)
                     if trace:
                         trace_manager.end_trace(trace.trace_id)
                     return response
                 except RouteEscalationException as e:
                     logger.warning(f"置信度不足，升级至 MDT: {e.reason}")
+                    self.event_memory.ingest(
+                        f"Simple RAG 升级至 MDT: {e.reason}",
+                        event_type=EventType.REFLECTION,
+                        metadata={"escalation_reason": e.reason},
+                    )
                     if trace:
                         trace.add_event("escalation_to_mdt", {"reason": e.reason})
                     await self._store_reflection(query.query, e.reason)
+                    run_ctx.route_path = "mdt_escalated"
                     result = await self._run_mdt(
                         query, profile,
                         departments=decision.departments or self._infer_departments(query.query),
@@ -273,17 +359,47 @@ class MedicalOrchestrator:
                         skill_hints=skill_hints,
                     )
                     await self._log_pipeline(timer, "mdt_escalated")
+                    # ---- 上下文: 记录升级路径 ----
+                    if self.context_manager:
+                        self.context_manager.add_conversation(
+                            query=query.query,
+                            response=result.answer,
+                            route_path="mdt_escalated",
+                            confidence=result.confidence,
+                            departments=result.departments,
+                        )
+                    self._finalize_run(run_ctx, result, context_manager=self.context_manager)
                     if trace:
                         trace_manager.end_trace(trace.trace_id)
                     return result
             else:
+                run_ctx.route_path = "mdt"
+                run_ctx.departments = decision.departments
+                self.event_memory.ingest(
+                    f"MDT 会诊开始: 科室={decision.departments}",
+                    event_type=EventType.CONSENSUS_FORMATION,
+                )
                 result = await self._run_mdt(
                     query, profile,
                     departments=decision.departments,
                     skill_hints=skill_hints,
                 )
+                self.event_memory.ingest(
+                    f"MDT 会诊完成: 信心={result.confidence}",
+                    event_type=EventType.DECISION,
+                )
                 await self._log_pipeline(timer, "mdt")
                 await self._maybe_extract_skill(result, query)
+                # ---- 上下文: 记录会诊 ----
+                if self.context_manager:
+                    self.context_manager.add_conversation(
+                        query=query.query,
+                        response=result.answer,
+                        route_path="mdt",
+                        confidence=result.confidence,
+                        departments=result.departments,
+                    )
+                self._finalize_run(run_ctx, result, context_manager=self.context_manager)
                 if trace:
                     trace_manager.end_trace(trace.trace_id)
                 return result
@@ -293,23 +409,29 @@ class MedicalOrchestrator:
                 trace.end_span(trace._roots[0].span_id if trace._roots else "", status="fallback")
                 trace_manager.end_trace(trace.trace_id)
             logger.warning("信息不足异常: CoT 安全退避")
-            return MedicalResponse(
+            self.event_memory.ingest("CoT安全退避: 信息不足", event_type=EventType.SAFETY_CHECK)
+            response = MedicalResponse(
                 answer=SAFE_FALLBACK_RESPONSE,
                 route_path="safe_fallback",
                 confidence=0.0,
                 is_safe_fallback=True,
             )
+            self._finalize_run(run_ctx, response)
+            return response
         except Exception as e:
             if trace:
                 trace.end_span(trace._roots[0].span_id if trace._roots else "", status="error",
-                               metadata={"error": str(e)})
+                                metadata={"error": str(e)})
                 trace_manager.end_trace(trace.trace_id)
             logger.error(f"系统异常: {e}", exc_info=True)
-            return MedicalResponse(
+            self.event_memory.ingest(f"系统异常: {e}", event_type=EventType.SAFETY_CHECK)
+            response = MedicalResponse(
                 answer="抱歉，系统处理过程中出现异常，请稍后重试或建议线下就医。",
                 route_path="error",
                 confidence=0.0,
             )
+            self._finalize_run(run_ctx, response)
+            return response
 
     async def _log_pipeline(self, timer: PipelineTimer, path: str):
         logger.info(
@@ -435,8 +557,17 @@ class MedicalOrchestrator:
         """存储归因反思记忆"""
         try:
             await self.reflection.generate_and_store(query, reason)
+            if self.context_manager:
+                self.context_manager.inject_reflection(f"历史教训: {reason}")
         except Exception as e:
             logger.error(f"反思存储失败: {e}")
+
+    def _finalize_run(self, run_ctx, response, context_manager=None):
+        """结束 Run，关联指标并持久化有价值内容"""
+        run_ctx.route_path = response.route_path
+        run_ctx.confidence = response.confidence
+        run_ctx.departments = response.departments or []
+        self.run_memory.finish_run(context_manager=context_manager)
 
     async def _maybe_extract_skill(self, response: MedicalResponse, query: MedicalQuery):
         """从成功回答中提取技能（Agent 自进化）"""

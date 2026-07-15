@@ -1,236 +1,373 @@
-"""上下文预算管理器 - 像管理预算一样管理上下文
+"""统一上下文管理器 — 聚合四层记忆 + 多轮对话 + 上下文窗口 + 组装器
 
-设计理念（来自 Agent Harness Context Management）:
-  "管理上下文像管理预算一样 —— 永久层压缩到 ≤8K，深度内容按需加载"
-  "通过分层加载对抗上下文污染"
-  "给 Agent 一张地图，而不是 1000 页说明书"
+设计理念:
+  "ContextManager 是 Agent 的记忆操作系统内核"
+  "它协调四层记忆的存取、对话状态的维护、上下文窗口的调度、以及最终的上下文组装"
 
-核心机制:
-  1. 三层上下文:
-     - Permanent (永久层): 系统提示、核心约束，始终保留
-     - Working (工作层): 当前对话、临时信息，按需保留
-     - Deep (深度层): 检索结果、长文档，按需加载/卸载
-  2. Token 预算追踪: 监控每层的 token 消耗
-  3. 压缩策略: 自动摘要/裁剪超过预算的内容
+参考架构:
+  - MemGPT OS: 内存管理单元 (MMU) 协调 Core/Archival/Recall 三层
+  - Harness ContextBudget: 分层预算 + 渲染 + 摘要
+  - LangChain BaseMemory: 统一的 load_memory_variables / save_context 接口
+  - LlamaIndex ChatMemoryBuffer: 从 token_limit 管理消息窗口
+
+统一接口:
+  上下文生命周期:
+    1. begin_session()     — 开始会话，初始化四层记忆
+    2. add_conversation()  — 记录一轮对话
+    3. prepare_context()   — 组装 LLM 上下文
+    4. end_session()       — 结束会话，持久化长期记忆
+
+  记忆操作:
+    - remember()   — 存入记忆（自动分级）
+    - recall()     — 检索记忆（跨层查询）
+    - forget()     — 删除记忆
+    - summarize()  — 压缩记忆
+
+  预算管理:
+    - gauge()      — 预算仪表盘
+    - check()      — 预算状态检查
+    - budget()     — 分配预算给各层
 """
+
 from __future__ import annotations
 
-import json
 import logging
-from dataclasses import dataclass, field
+import time
 from typing import Optional
+
+from context.memory_hierarchy import (
+    MemoryHierarchy, MemoryEntry, MemoryHierarchyConfig,
+    MemoryTier, MessageRole, TokenEstimator,
+)
+from context.conversation_memory import ConversationMemory, ConversationConfig
+from context.context_window import ContextWindow, ContextWindowConfig, BudgetReport, BudgetStatus
+from context.context_assembler import ContextAssembler, AssembleConfig, AssembledContext
+from context.compaction import CompactionConfig, ContentAwareCompactor
 
 logger = logging.getLogger(__name__)
 
 
-# ============================================================
-# Token 估算器
-# ============================================================
-
-class TokenCounter:
-    """简易 Token 估算器
-
-    中文 ≈ 1 token/字符
-    英文 ≈ 1 token/4 字符
-    """
-
-    @staticmethod
-    def estimate(text: str) -> int:
-        if not text:
-            return 0
-        chinese_chars = sum(1 for c in text if '\u4e00' <= c <= '\u9fff')
-        other_chars = len(text) - chinese_chars
-        return int(chinese_chars * 1.5 + other_chars / 4)
-
-    @staticmethod
-    def truncate(text: str, max_tokens: int) -> str:
-        """按 token 预算截断文本"""
-        if TokenCounter.estimate(text) <= max_tokens:
-            return text
-        ratio = max_tokens / max(TokenCounter.estimate(text), 1)
-        keep_chars = int(len(text) * ratio * 0.9)
-        return text[:keep_chars] + "\n... [已截断]"
-
-
-# ============================================================
-# 上下文预算
-# ============================================================
-
-@dataclass
-class ContextBudget:
-    permanent_tokens: int = 2000
-    working_tokens: int = 4000
-    deep_tokens: int = 8000
-    total_tokens: int = 14000
-
-    @property
-    def remaining(self) -> int:
-        return self.total_tokens
-
-    def layer_budget(self, layer: str) -> int:
-        return {
-            "permanent": self.permanent_tokens,
-            "working": self.working_tokens,
-            "deep": self.deep_tokens,
-        }.get(layer, 0)
-
-
-# ============================================================
-# 上下文管理器
-# ============================================================
-
 class ContextManager:
-    """分层上下文管理器
+    """统一上下文管理器 — Agent 的记忆操作系统内核
+
+    整合四个子系统:
+    1. MemoryHierarchy  — 四层记忆存取 (Working / Short-Term / Long-Term / External)
+    2. ConversationMemory — 多轮对话管理 (Turns / Topics / Phases)
+    3. ContextWindow — 上下文窗口调度 (Budget / Pruning / Dedup)
+    4. ContextAssembler — 上下文组装 (RAG / Expert / Consensus / Verification)
 
     用法:
-        ctx = ContextManager()
-        ctx.set_permanent("你是医疗专家...")
-        ctx.add_working("用户: 我有高血压...")
-        ctx.load_deep(docs)  # 按需加载
-        print(ctx.render())  # 组装完整上下文
-        print(ctx.summary()) # 查看预算使用
+        ctx = ContextManager(user_id="user_001")
+
+        # 开始会话
+        ctx.begin_session()
+
+        # 第一轮: 设置角色和约束
+        ctx.remember("你是医疗知识助手", tier=MemoryTier.WORKING, role=MessageRole.SYSTEM)
+        ctx.remember("只基于文献回答", tier=MemoryTier.WORKING, role=MessageRole.SYSTEM)
+
+        # 注入长期记忆 (技能/反思)
+        ctx.remember("[技能] 高血压合并痛风: 避免NSAIDs", tier=MemoryTier.LONG_TERM)
+        ctx.remember("[教训] 未检查肾功能即推荐布洛芬", tier=MemoryTier.LONG_TERM)
+
+        # 加载检索结果
+        ctx.load_documents(retrieved_docs)
+
+        # 组装上下文
+        result = ctx.prepare_context(
+            query="高血压患者痛风怎么办?",
+            strategy="simple_rag",
+            role="你是医疗助手",
+        )
+
+        # 记录本轮对话
+        ctx.add_conversation(
+            query="高血压患者痛风怎么办?",
+            response=llm_response,
+            route_path="simple_rag",
+            confidence=0.85,
+        )
+
+        # 查看预算
+        print(ctx.gauge())
     """
 
-    def __init__(self, budget: Optional[ContextBudget] = None):
-        self.budget = budget or ContextBudget()
-        self.counter = TokenCounter()
+    def __init__(
+        self,
+        user_id: str = "default",
+        session_id: str = "",
+        hierarchy_config: Optional[MemoryHierarchyConfig] = None,
+        conversation_config: Optional[ConversationConfig] = None,
+        window_config: Optional[ContextWindowConfig] = None,
+        assemble_config: Optional[AssembleConfig] = None,
+        compaction_config: Optional[CompactionConfig] = None,
+    ):
+        self.user_id = user_id
+        self.session_id = session_id or f"sess_{user_id}_{int(time.time())}"
 
-        self._permanent: list[str] = []
-        self._working: list[str] = []
-        self._deep: list[str] = []
-        self._deep_metadata: dict[str, str] = {}
+        self.hierarchy = MemoryHierarchy(hierarchy_config)
+        self.conversation = ConversationMemory(
+            user_id=user_id,
+            session_id=self.session_id,
+            config=conversation_config,
+        )
+        self.window = ContextWindow(window_config)
+        self.assembler = ContextAssembler(assemble_config)
+        self.compactor = ContentAwareCompactor(compaction_config)
 
-    # ---- 各层操作 ----
+        self._session_started = False
+        self._query_count = 0
 
-    def set_permanent(self, text: str):
-        """设置永久层 (系统提示、核心约束)"""
-        self._permanent = [text]
+    def begin_session(self):
+        """开始会话"""
+        self._session_started = True
+        self._query_count = 0
+        logger.info(f"Context session started: {self.session_id}")
 
-    def append_permanent(self, text: str):
-        """追加永久层内容"""
-        self._permanent.append(text)
+    def end_session(self):
+        """结束会话"""
+        self._session_started = False
+        logger.info(f"Context session ended: {self.session_id} (queries={self._query_count})")
 
-    def add_working(self, text: str):
-        """添加工作层 (对话历史)"""
-        self._working.append(text)
+    # ============================================================
+    # 记忆操作 — 统一的存取接口
+    # ============================================================
 
-    def clear_working(self):
-        """清空工作层"""
-        self._working.clear()
+    def remember(
+        self,
+        content: str,
+        tier: MemoryTier = MemoryTier.SHORT_TERM,
+        role: MessageRole = MessageRole.USER,
+        importance: float = 0.5,
+        metadata: Optional[dict] = None,
+    ) -> MemoryEntry:
+        """存入记忆 — 自动路由到正确的层级"""
+        if tier == MemoryTier.WORKING:
+            return self.hierarchy.add_working(content, role, importance, metadata)
+        elif tier == MemoryTier.SHORT_TERM:
+            return self.hierarchy.add_short_term(content, role, importance, metadata)
+        elif tier == MemoryTier.LONG_TERM:
+            return self.hierarchy.add_long_term(content, role, importance, metadata)
+        elif tier == MemoryTier.EXTERNAL:
+            return self.hierarchy.add_external(content, role, importance, metadata)
 
-    def load_deep(self, documents: list, max_tokens: int = 0):
-        """按需加载深度层 (检索结果)
+    def set_system_prompt(self, content: str, importance: float = 1.0):
+        """设置系统提示 (永久层)"""
+        self.hierarchy.set_working(content, MessageRole.SYSTEM, importance)
+        self.window.set_permanent(content, importance)
 
-        参数:
-            documents: DocumentChunk 列表或 dict 列表
-            max_tokens: 深度层 token 预算
+    def append_system_prompt(self, content: str, importance: float = 0.5):
+        """追加系统提示"""
+        self.hierarchy.add_working(content, MessageRole.SYSTEM, importance)
+        self.window.append_permanent(content, importance)
+
+    def inject_skill(self, skill_text: str):
+        """注入技能记忆到长期记忆层"""
+        self.hierarchy.add_long_term(
+            f"[技能] {skill_text}",
+            role=MessageRole.MEMORY,
+            importance=0.7,
+            metadata={"type": "skill"},
+        )
+
+    def inject_reflection(self, reflection_text: str):
+        """注入反思记忆到长期记忆层"""
+        self.hierarchy.add_long_term(
+            f"⚠️ {reflection_text}",
+            role=MessageRole.MEMORY,
+            importance=0.8,
+            metadata={"type": "reflection"},
+        )
+
+    def inject_profile(self, profile_text: str):
+        """注入患者画像到穿透项"""
+        self.conversation.add_penetration(f"患者信息: {profile_text}")
+
+    def load_documents(self, documents: list, max_tokens: int = 0):
+        """加载检索结果到外部记忆层和上下文窗口"""
+        self.hierarchy.load_external(
+            documents,
+            format_fn=lambda doc: (
+                f"[{getattr(doc, 'source', '')}] {getattr(doc, 'content', str(doc))}"
+            ),
+        )
+        self.window.load_deep(documents, max_tokens)
+
+    def add_conversation(
+        self,
+        query: str,
+        response: str,
+        route_path: str = "",
+        confidence: float = 0.0,
+        departments: Optional[list[str]] = None,
+    ):
+        """记录一轮完整对话"""
+        self._query_count += 1
+
+        self.hierarchy.add_short_term(
+            f"用户: {query}",
+            role=MessageRole.USER,
+            importance=0.6,
+            metadata={"turn": self._query_count},
+        )
+        self.hierarchy.add_short_term(
+            f"助手: {response[:800]}",
+            role=MessageRole.ASSISTANT,
+            importance=0.5,
+            metadata={"turn": self._query_count, "route": route_path},
+        )
+
+        self.window.add_working(
+            f"用户: {query}",
+            importance=0.6,
+            meta={"turn": self._query_count},
+        )
+        self.window.add_working(
+            f"助手: {response[:500]}",
+            importance=0.5,
+            meta={"turn": self._query_count},
+        )
+
+        self.conversation.add_turn(
+            query=query,
+            response=response,
+            route_path=route_path,
+            confidence=confidence,
+            departments=departments,
+        )
+
+    # ============================================================
+    # 上下文组装
+    # ============================================================
+
+    def prepare_context(
+        self,
+        query: str,
+        strategy: str = "simple_rag",
+        role: str = "",
+        constraints: Optional[list[str]] = None,
+        documents: Optional[list] = None,
+        profile: Optional[str] = None,
+    ) -> str:
+        """准备 LLM 消费上下文 — 一站式组装
+
+        strategy:
+            - "simple_rag": 简单 RAG
+            - "mdt_expert": 多专家 ReAct
+            - "consensus": 共识提炼
         """
-        if max_tokens <= 0:
-            max_tokens = self.budget.deep_tokens
+        if documents:
+            self.load_documents(documents)
 
-        self._deep.clear()
-        self._deep_metadata.clear()
-        budget = max_tokens
+        history = self.conversation.get_history_context()
+        skills = self._collect_skills()
+        reflections = self._collect_reflections()
 
-        for doc in documents:
-            if hasattr(doc, "content"):
-                content = doc.content
-                source = getattr(doc, "source", "")
-                doc_id = getattr(doc, "doc_id", "")
-            elif isinstance(doc, dict):
-                content = doc.get("content", "")
-                source = doc.get("source", "")
-                doc_id = doc.get("doc_id", doc.get("id", ""))
-            else:
-                continue
+        if strategy == "simple_rag":
+            assembled = self.assembler.assemble_for_rag(
+                role=role or "你是一个医疗知识助手",
+                query=query,
+                documents=documents,
+                constraints=constraints,
+                skills=skills,
+                reflections=reflections,
+                profile=profile,
+                history=history,
+            )
+            return assembled.messages
 
-            tokens = self.counter.estimate(content)
-            if tokens > budget:
-                content = self.counter.truncate(content, budget)
-                tokens = self.counter.estimate(content)
+        elif strategy == "mdt_expert":
+            assembled = self.assembler.assemble_for_expert(
+                department=role,
+                query=query,
+                profile=profile,
+                reflection_hint="\n".join(reflections) if reflections else "",
+                skill_hints="\n".join(skills) if skills else "",
+            )
+            return assembled.messages
 
-            if tokens <= budget:
-                self._deep.append(f"[{source}] {content}")
-                self._deep_metadata[doc_id] = source
-                budget -= tokens
-                if budget <= 0:
-                    break
+        elif strategy == "consensus":
+            assembled = self.assembler.assemble_for_consensus(
+                expert_opinions=[query],
+                profile=profile,
+            )
+            return assembled.messages
 
-    def clear_deep(self):
-        """卸载深度层"""
-        self._deep.clear()
-        self._deep_metadata.clear()
+        return [{"role": "user", "content": query}]
 
-    # ---- Token 预算 ----
+    def render_context(self, query: Optional[str] = None) -> str:
+        """渲染拼接后的完整上下文文本 (调试/日志用)"""
+        return self.hierarchy.assemble_context(query)
 
-    def usage(self, layer: str) -> int:
-        if layer == "permanent":
-            return self.counter.estimate("\n".join(self._permanent))
-        elif layer == "working":
-            return self.counter.estimate("\n".join(self._working))
-        elif layer == "deep":
-            return self.counter.estimate("\n".join(self._deep))
-        return 0
+    # ============================================================
+    # 预算管理
+    # ============================================================
 
-    @property
-    def total_usage(self) -> int:
-        return self.usage("permanent") + self.usage("working") + self.usage("deep")
+    def gauge(self) -> str:
+        """预算仪表盘"""
+        return self.window.gauge()
+
+    def check(self) -> BudgetReport:
+        """检查预算状态"""
+        return self.window.check_budget()
 
     def is_over_budget(self) -> bool:
-        return self.total_usage > self.budget.total_tokens
+        """是否超预算"""
+        return self.check().status == BudgetStatus.OVERFLOW
 
-    def layer_gauge(self) -> dict:
-        """返回各层预算使用率"""
-        return {
-            "permanent": {"used": self.usage("permanent"), "budget": self.budget.permanent_tokens,
-                          "ratio": round(self.usage("permanent") / max(self.budget.permanent_tokens, 1), 2)},
-            "working": {"used": self.usage("working"), "budget": self.budget.working_tokens,
-                        "ratio": round(self.usage("working") / max(self.budget.working_tokens, 1), 2)},
-            "deep": {"used": self.usage("deep"), "budget": self.budget.deep_tokens,
-                     "ratio": round(self.usage("deep") / max(self.budget.deep_tokens, 1), 2)},
-            "total": {"used": self.total_usage, "budget": self.budget.total_tokens,
-                      "ratio": round(self.total_usage / max(self.budget.total_tokens, 1), 2)},
-        }
+    def budget_summary(self) -> dict:
+        """预算摘要"""
+        return self.hierarchy.usage_report()
 
-    # ---- 渲染 ----
+    # ============================================================
+    # 清理
+    # ============================================================
 
-    def render(self) -> str:
-        """组装完整上下文"""
-        layers = []
+    def clear_conversation(self):
+        """清空对话层（保留系统提示和长期记忆）"""
+        self.hierarchy.clear_tier(MemoryTier.SHORT_TERM)
+        self.window.clear_working()
 
-        if self._permanent:
-            layers.append("\n".join(self._permanent))
+    def clear_all(self):
+        """清空所有记忆"""
+        for tier in MemoryTier:
+            self.hierarchy.clear_tier(tier)
+        self.window.clear()
+        self.conversation.reset_session()
 
-        if self._working:
-            layers.append("--- 对话历史 ---")
-            layers.extend(self._working[-20:])
-
-        if self._deep:
-            layers.append("--- 参考文献 ---")
-            if self._deep_metadata:
-                layers.append("参考资料列表:")
-                for i, text in enumerate(self._deep):
-                    layers.append(f"[{i+1}] {text}")
-            else:
-                layers.extend(self._deep)
-
-        return "\n".join(layers)
-
-    def summary(self) -> str:
-        """上下文预算摘要"""
-        gauge = self.layer_gauge()
-        lines = ["上下文预算使用情况:"]
-        for layer, data in gauge.items():
-            bar = "█" * int(data["ratio"] * 20) + "░" * (20 - int(data["ratio"] * 20))
-            lines.append(f"  {layer:12s} |{bar}| {data['used']:5d}/{data['budget']:5d} ({data['ratio']:.0%})")
-        return "\n".join(lines)
-
-    # ---- 快照 ----
+    # ============================================================
+    # 状态
+    # ============================================================
 
     def snapshot(self) -> dict:
         return {
-            "permanent_count": len(self._permanent),
-            "working_count": len(self._working),
-            "deep_count": len(self._deep),
-            "usage": self.layer_gauge(),
+            "user_id": self.user_id,
+            "session_id": self.session_id,
+            "query_count": self._query_count,
+            "memories": self.hierarchy.snapshot(),
+            "conversation": self.conversation.stats(),
+            "budget": self.check().__dict__,
         }
+
+    # ============================================================
+    # 内部辅助
+    # ============================================================
+
+    def _collect_skills(self) -> list[str]:
+        """从长期记忆收集技能提示"""
+        skills = []
+        for entry in self.hierarchy._long_term:
+            if entry.metadata.get("type") == "skill" or "[技能]" in entry.content:
+                skills.append(entry.content)
+        return skills[-3:]
+
+    def _collect_reflections(self) -> list[str]:
+        """从长期记忆收集反思提示"""
+        reflections = []
+        for entry in self.hierarchy._long_term:
+            if entry.metadata.get("type") == "reflection" or "⚠️" in entry.content:
+                reflections.append(entry.content)
+        return reflections[-3:]
+
+
+ContextBudget = MemoryHierarchyConfig

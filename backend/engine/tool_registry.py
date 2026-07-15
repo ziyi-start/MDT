@@ -136,3 +136,19 @@ def _infer_parameters(fn: Callable) -> dict:
 
 # 全局工具注册器 - 所有工具默认注册到此实例
 global_tool_registry = ToolRegistry()
+
+# ---- 注册 Agent 自主记忆工具 ----
+from tools.memory_tools import remember, forget, recall, MEMORY_TOOL_DEFINITIONS
+
+for tool_def in MEMORY_TOOL_DEFINITIONS:
+    fn_map = {"remember": remember, "forget": forget, "recall": recall}
+    name = tool_def["name"]
+    global_tool_registry._tools[name] = {
+        "schema": {
+            "name": name,
+            "description": tool_def["description"],
+            "parameters": tool_def["parameters"],
+        },
+        "fn": fn_map[name],
+    }
+    logger.info(f"Memory tool registered: {name}")

@@ -10,7 +10,7 @@
 </h1>
 
 <h3 align="center">
-  多科室专家 ReAct 会诊 &nbsp;|&nbsp; Hybrid RAG 混合检索 &nbsp;|&nbsp; 四库分层记忆 &nbsp;|&nbsp; Agent 自进化
+  多科室专家 ReAct 会诊 &nbsp;|&nbsp; Hybrid RAG 混合检索 &nbsp;|&nbsp; 四库分层记忆 &nbsp;|&nbsp; Agent 自进化 &nbsp;|&nbsp; SSE 流式输出 &nbsp;|&nbsp; MCP 协议集成
 </h3>
 
 <p align="center">
@@ -52,15 +52,19 @@
 
 ## 系统架构
 
-系统将端到端医疗问答流程划分为 **四个核心层 + 一个工程外壳（Harness）**：
+系统将端到端医疗问答流程划分为 **四个核心层 + 一个工程外壳（Harness）+ 上下文操作系统**：
 
 **① 交互与动态路由层** — 规则拦截（NER + 正则）→ LLM 结构化路由（Guided JSON）→ 置信度评估 + 携因打回升级
 
 **② 多专家会诊层** — 并发启动心内科、消化科、风湿科等多个科室专家的 ReAct Agent，各自推理后共识提炼 + 共识引导二次检索
 
-**③ 记忆与检索协同层** — 四库集合（Medical_KB / Patient_Profile / Reflection_Mem / Skill_Mem）+ Hybird RAG 检索 + BGE Cross-Encoder 重排
+**③ 记忆与检索协同层** — 四库集合（Medical_KB / Patient_Profile / Reflection_Mem / Skill_Mem）+ Hybrid RAG 检索 + BGE Cross-Encoder 重排
 
 **④ 反思与决策层** — DecisionMaker 评估质量与幻觉风险，不通过则触发归因反思写入 Reflection_Mem，必要时触发 CoT 安全退避
+
+**⑤ 上下文操作系统 (v2.0)** — 四层记忆 (L0 Working / L1 Short-Term / L2 Long-Term / L3 External) + 多轮对话管理 + 上下文窗口调度 + 内容感知压缩 + 智能组装
+
+**⑥ API 传输层** — REST 同步 / SSE 流式 (P1) / WebSocket 双工 + MCP 外部工具协议 (P2)
 
 ---
 
@@ -120,6 +124,31 @@
 | **决策层** | DecisionMaker.quality_score < 0.5 | 拒绝通过，触发反思后返回安全回复 |
 | **兜底层** | 异常/超时/幻觉风险高 | 硬编码安全降级回复，提示就医 |
 
+### 7. 上下文操作系统 v2.0 (Agent OS)
+
+参考 MemGPT + LangChain + Harness，实现四层记忆架构与完整上下文生命周期管理：
+
+| 层级 | 容量 | 内容 | 策略 |
+|------|------|------|------|
+| L0 Working | ~2K tokens | 系统提示、核心约束 | 永久保留 |
+| L1 Short-Term | ~4K tokens | 对话历史滑动窗口 | 时间衰减 + 重要性评分 |
+| L2 Long-Term | ~8K tokens | 技能记忆 + 反思记忆 | 按需检索注入 |
+| L3 External | ~8K tokens | 检索结果 + 外部知识 | 按需加载 |
+
+**四大技术突破**:
+- **内容感知压缩**: 去重→规则评分→LLM-guided 三级级联，按医学优先级保留事实
+- **Agent 自主记忆**: remember/forget/recall 工具，Agent 通过 tool calling 自主管理记忆
+- **事件驱动情节记忆**: Bayesian surprise 自动分割事件 + 两阶段检索（语义+时间邻接）
+- **Run-level 上下文隔离**: Session/Run/Turn/User 四维隔离 + 用户显式反馈环
+
+### 8. SSE 流式输出 (P1)
+
+`POST /api/query/stream` — 基于 Server-Sent Events 协议，支持 heartbeat 保活、分块输出（80 字符/块）、实时状态推送，`chat_stream()` 方法原生支持 LLM token 级流式 + tool_calls 增量累积。
+
+### 9. MCP 协议集成 (P2)
+
+参考 Anthropic MCP Specification (JSON-RPC 2.0)，支持 stdio (本地子进程) 和 SSE (远程 HTTP) 双传输方式。发现的 MCP 工具自动注册到 `global_tool_registry`，Agent ReAct 循环中可直接调用外部工具（如 PubMed API、药品数据库等）。
+
 ---
 
 ## 技术栈
@@ -173,7 +202,8 @@ MDT/
 │   ├── engine/                      #   ⚙️ ReAct 执行引擎 + Harness 安全外壳
 │   │   ├── react_engine.py          #     手写 ReAct 循环（推理→工具调用→结果注入→继续推理）
 │   │   ├── tool_registry.py         #     全局工具注册器（装饰器注册 + schema 生成 + 异步执行）
-│   │   └── safety_guard.py          #     [Harness] 限流 + 验证 + 成本追踪
+│   │   ├── safety_guard.py          #     [Harness] 限流 + 验证 + 成本追踪
+│   │   └── mcp_client.py            #     [MCP] 外部工具协议客户端 (stdio + SSE 双传输)
 │   │
 │   ├── router/                      #   🧭 动态路由层
 │   │   ├── rule_interceptor.py      #     NER + 正则拦截（快车道，含 20+ 科室映射表）
@@ -189,14 +219,16 @@ MDT/
 │   ├── memory/                      #   🧠 记忆模块
 │   │   ├── profile_extractor.py     #     渐进式患者画像抽取 (LLM → upsert Patient_Profile)
 │   │   ├── reflection_manager.py    #     归因反思管理 (失败教训 → Reflection_Mem)
-│   │   └── skill_manager.py         #     [Agent自进化] 技能提取/存储/add-merge-discard/版本管理 (359行)
+│   │   ├── skill_manager.py         #     [Agent自进化] 技能提取/存储/add-merge-discard/版本管理 (359行)
+│   │   └── event_memory.py          #     [突破3] 事件驱动情节记忆 (Bayesian surprise 分割)
 │   │
 │   ├── tools/                       #   🔧 Agent 可调用工具
 │   │   ├── literature_search.py     #     文献检索工具 (Agent 自主构建专业检索词)
-│   │   └── drug_interaction.py      #     药物冲突查询工具 (内置 10+ 种药物冲突知识库)
+│   │   ├── drug_interaction.py      #     药物冲突查询工具 (内置 10+ 种药物冲突知识库)
+│   │   └── memory_tools.py          #     [突破2] Agent 自主记忆工具 (remember/forget/recall)
 │   │
 │   ├── workflow/                    #   📋 工作流编排层
-│   │   ├── medical_orchestrator.py  #     顶层闭环编排器 + DecisionMaker (459行, 含 Harness 集成)
+│   │   ├── medical_orchestrator.py  #     顶层闭环编排器 + DecisionMaker (589行, 含 8 子系统深度集成)
 │   │   ├── simple_rag.py            #     Simple RAG 流程 (反思拦截→检索→重排→LLM生成)
 │   │   └── mdt_consultation.py      #     MDT 会诊流程 (并发专家ReAct→共识提炼→共识引导检索)
 │   │
@@ -209,8 +241,15 @@ MDT/
 │   │   ├── evaluator.py             #     7 维确定性评分引擎 (403行, 零 LLM 调用)
 │   │   └── experiment.py            #     A/B 实验框架
 │   │
-│   └── context/                     #   📐 [Harness] 上下文预算
-│       └── manager.py               #     三层上下文预算 (Permanent/Working/Deep)
+│   └── context/                     #   📐 [v2.0] 上下文操作系统 (8 模块)
+│       ├── __init__.py              #     导出所有模块
+│       ├── memory_hierarchy.py      #     [核心] 四层记忆架构 (MemGPT-inspired)
+│       ├── conversation_memory.py   #     [核心] 多轮对话管理 (LangChain-inspired)
+│       ├── context_window.py        #     [核心] 上下文窗口调度 (Harness-inspired)
+│       ├── context_assembler.py     #     [核心] 上下文组装器 (Anthropic-inspired)
+│       ├── compaction.py            #     [突破1] 内容感知压缩 (Letta-inspired)
+│       ├── run_memory.py            #     [突破4] Run-level 上下文隔离 (Mem0-inspired)
+│       └── manager.py               #     [统一入口] ContextManager (Agent OS 内核)
 │
 ├── config/
 │   └── default.yaml                 #   ────── 默认配置 (135行, 全部参数 + 注释) ──────
@@ -361,10 +400,20 @@ curl -X POST http://localhost:8000/api/query \
 
 | 方法 | 路径 | 分类 | 说明 |
 |------|------|------|------|
-| `POST` | `/api/query` | 核心 | 医疗问答（REST） |
+| `POST` | `/api/query` | 核心 | 医疗问答（REST 同步） |
+| `POST` | `/api/query/stream` | 核心 | **SSE 流式查询** (P1, 心跳 + 分块) |
+| `WS` | `/ws/query` | 核心 | WebSocket 实时双工查询 |
 | `GET` | `/api/health` | 运维 | 健康检查 + Milvus 连接状态 |
 | `GET` | `/api/metrics` | 监控 | 运行时聚合指标（成功率/退避率/路由分布/延迟） |
-| `WS` | `/ws/query` | 核心 | WebSocket 实时流式查询 |
+| `GET` | `/api/mcp/status` | MCP | **MCP 客户端状态** (P2, connected/idle) |
+| `GET` | `/api/mcp/tools` | MCP | **MCP 已发现工具列表** (支持 ?server= 过滤) |
+| `POST` | `/api/mcp/connect` | MCP | **连接 MCP Server** (stdio 或 SSE) |
+| `POST` | `/api/mcp/disconnect` | MCP | **断开 MCP Server** |
+| `POST` | `/api/feedback` | Harness | 提交用户反馈 (rating 0.0-1.0) |
+| `GET` | `/api/feedback` | Harness | 获取最近反馈记录 |
+| `GET` | `/api/harness/events` | Harness | **事件记忆查询** (突破3) |
+| `GET` | `/api/harness/runs` | Harness | **Run 执行记录** (突破4) |
+| `GET` | `/api/harness/context/snapshot` | Harness | **上下文快照** (memories + conversation) |
 | `GET` | `/api/harness/traces` | Harness | 获取最近 N 条全链路追踪记录 |
 | `GET` | `/api/harness/traces/{id}` | Harness | 获取指定 Trace 详情（含完整 Span 树） |
 | `GET` | `/api/harness/evaluate` | Harness | 执行 7 维确定性评分 |
@@ -400,8 +449,11 @@ curl -X POST http://localhost:8000/api/query \
 | `skill.min_confidence_for_extraction` | float | `0.7` | 技能提取最低置信度 |
 | `harness.tracing.enabled` | bool | `true` | 链路追踪开关 |
 | `harness.context.total_tokens` | int | `14000` | 上下文总 Token 预算 |
+| `harness.context.compaction_llm_enabled` | bool | `true` | 启用 LLM-guided 压缩 |
+| `harness.context.surprise_threshold` | float | `1.5` | Bayesian surprise 事件分割阈值 |
+| `mcp.enabled` | bool | `false` | MCP 协议集成开关 |
 
-完整参数见 `config/default.yaml`（135 行，含逐项注释）。
+完整参数见 `config/default.yaml`（172 行，含逐项注释）。
 
 ---
 
@@ -485,7 +537,7 @@ python scripts/evaluate_rag.py --mode generation --api-url http://localhost:8000
 
 ## Harness 工程框架
 
-基于 **Agent = Model + Harness** 设计理念，Harness 是模型之外的工程外壳，提供四个维度的工程保障：
+基于 **Agent = Model + Harness** 设计理念，Harness 是模型之外的工程外壳，提供五个维度的工程保障：
 
 ### 追踪观测 (Tracing)
 
@@ -499,9 +551,27 @@ python scripts/evaluate_rag.py --mode generation --api-url http://localhost:8000
 | **工具参数验证** | `validate_tool_args` 预钩子，在工具执行前拦截非法参数 |
 | **成本追踪** | 实时累计 LLM Token 消耗，按模型和阶段分解 |
 
-### 上下文预算 (Context Budget)
+### 上下文操作系统 v2.0 (Context OS)
 
-三层分层管理 LLM 上下文窗口：Permanent 层（2000 tokens，系统提示与核心约束）、Working 层（4000 tokens，对话历史与工具调用记录）、Deep 层（8000 tokens，检索结果与文献上下文），总量硬上限 14000 tokens，超出触发裁剪。
+参考 MemGPT + LangChain + Harness + Anthropic + Mem0 设计：
+
+| 模块 | 功能 | 参考架构 |
+|------|------|----------|
+| **四层记忆** (L0-L3) | Working→Short-Term→Long-Term→External 分层管理 | MemGPT memory hierarchy |
+| **多轮对话** | 状态机、话题追踪、摘要压缩、上下文穿透 | LangChain SummaryBuffer |
+| **窗口调度** | 三级预算 + 仪表盘 + 压缩管道 | Harness ContextBudget |
+| **内容感知压缩** | 去重→规则评分→LLM-guided 三级级联 | Letta Compaction |
+| **Agent 自主记忆** | remember/forget/recall 工具 | ChatGPT memory tool |
+| **事件情节记忆** | Bayesian surprise 分割 + 两阶段检索 | EM-LLM (ICLR 2025) |
+| **Run 级隔离** | Session/Run/Turn/User 四维 + 反馈环 | Mem0 + LangGraph |
+
+### 流式与外部工具集成
+
+| 功能 | 说明 | 实现 |
+|------|------|------|
+| **SSE 流式** | `POST /api/query/stream`，心跳 + 分块输出 | OpenAI SSE 协议 |
+| **MCP 协议** | 外部工具通过 JSON-RPC 2.0 接入 | Anthropic MCP stdio/SSE |
+| **WebSocket** | `ws://localhost:8000/ws/query` 双工通信 | FastAPI WebSocket |
 
 ### A/B 实验框架
 

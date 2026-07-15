@@ -72,6 +72,7 @@ class LLMConfig:
         "confidence_check": 0.1,
         "reflection": 0.1,
         "profile_extraction": 0.1,
+        "skill_extraction": 0.1,
         "decision_maker": 0.1,
         "consensus": 0.3,
     })
@@ -201,6 +202,29 @@ class HarnessContextConfig:
     deep_tokens: int = 8000
     total_tokens: int = 14000
 
+    short_term_window_size: int = 20
+    importance_threshold: float = 0.5
+    recency_decay_rate: float = 0.1
+
+    max_turns: int = 20
+    max_history_tokens: int = 4000
+    summary_threshold_turns: int = 6
+    topic_drift_threshold: float = 0.3
+    context_penetration_ratio: float = 0.1
+
+    warning_threshold: float = 0.75
+    critical_threshold: float = 0.90
+    dedup_enabled: bool = True
+    compression_enabled: bool = True
+    compression_summary_ratio: float = 0.3
+    response_reserved_tokens: int = 2048
+
+    compaction_llm_enabled: bool = True
+    compaction_max_tokens: int = 2000
+    surprise_threshold: float = 1.5
+    max_events_per_session: int = 100
+    temporal_retrieval_window: int = 3
+
 
 @dataclass
 class HarnessConfig:
@@ -208,6 +232,12 @@ class HarnessConfig:
     evaluator: HarnessEvaluatorConfig = field(default_factory=HarnessEvaluatorConfig)
     safety: HarnessSafetyConfig = field(default_factory=HarnessSafetyConfig)
     context: HarnessContextConfig = field(default_factory=HarnessContextConfig)
+
+
+@dataclass
+class MCPConfig:
+    enabled: bool = False
+    servers: list = field(default_factory=list)
 
 
 @dataclass
@@ -224,6 +254,7 @@ class AppConfig:
     services: ServicesConfig = field(default_factory=ServicesConfig)
     server: ServerConfig = field(default_factory=ServerConfig)
     harness: HarnessConfig = field(default_factory=HarnessConfig)
+    mcp: MCPConfig = field(default_factory=MCPConfig)
     default_user_id: str = "default_user"
 
 

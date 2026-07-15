@@ -172,7 +172,7 @@ class MDTConsultationWorkflow:
                 if reranked:
                     evidence_lines = []
                     for doc in reranked:
-                        evidence_lines.append(f"[{evidence_lines.__len__() + 1}] {doc.content}")
+                        evidence_lines.append(f"[{len(evidence_lines) + 1}] {doc.content}")
                         if doc.source:
                             sources.append(doc.source)
                     evidence_text = "\n".join(evidence_lines)
