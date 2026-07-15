@@ -43,7 +43,7 @@ class SimpleRAGWorkflow:
 
     async def run(
         self, query: MedicalQuery, profile: PatientProfile | None = None,
-        skill_hints: str = "",
+        skill_hints: str = "", history_context: str = "",
     ) -> tuple[MedicalResponse, list[DocumentChunk]]:
         """执行简单 RAG 流程
 
@@ -62,17 +62,11 @@ class SimpleRAGWorkflow:
             except Exception as e:
                 logger.warning(f"Simple RAG 反思检索失败: {e}")
 
-        # 1. 完整检索（必须用完整 top_k，预检的少量文档不足以做重排判断）
+        # 1. 完整检索
         documents = await self.retriever.retrieve(
-            query=query.query,
-            profile=profile,
-            top_k=cfg.retrieval.top_k,
+            query=query.query, profile=profile, top_k=cfg.retrieval.top_k,
         )
-
-        # 2. 重排去噪（Medical Reranker 打压临床逻辑无关的噪声）
         reranked = await self.reranker.rerank(query.query, documents, top_k=cfg.retrieval.rerank_top_k)
-
-        # 2.1 CoT 安全退避检查
         if not reranked or self.reranker.is_insufficient(reranked):
             from memory.reflection_manager import InsufficientInformationException
             max_score = reranked[0].score if reranked else 0
@@ -80,18 +74,17 @@ class SimpleRAGWorkflow:
                 f"重排得分极低 (最高 {max_score:.3f})，知识库无可靠相关知识"
             )
 
-        # 3. 构建上下文（带文档编号，供 LLM 引用）
         context = "\n\n".join(
-            f"[Source: Doc {i+1}] {doc.content}"
-            for i, doc in enumerate(reranked)
+            f"[Source: Doc {i+1}] {doc.content}" for i, doc in enumerate(reranked)
         )
 
-        # 4. LLM 生成回答（要求输出引用来源）
         system_prompt = SIMPLE_RAG_SYSTEM_PROMPT
         if reflection_hint:
             system_prompt += f"\n\n{reflection_hint}"
         if skill_hints:
             system_prompt += f"\n\n{skill_hints}"
+        if history_context:
+            system_prompt += f"\n\n--- 对话历史 ---\n{history_context}"
 
         resp = await self.llm.chat(
             messages=[
@@ -106,12 +99,11 @@ class SimpleRAGWorkflow:
             route_path="simple_rag",
             sources=sources,
         )
-
         return response, reranked
 
     async def run_stream(
         self, query: MedicalQuery, profile: PatientProfile | None = None,
-        skill_hints: str = "",
+        skill_hints: str = "", history_context: str = "",
     ) -> AsyncIterator[dict]:
         """流式执行 Simple RAG — 检索+重排后，用 chat_stream 逐 token 输出
 
@@ -150,6 +142,8 @@ class SimpleRAGWorkflow:
             system_prompt += f"\n\n{reflection_hint}"
         if skill_hints:
             system_prompt += f"\n\n{skill_hints}"
+        if history_context:
+            system_prompt += f"\n\n--- 对话历史 ---\n{history_context}"
 
         yield {"type": "status", "text": "LLM 生成中..."}
         collected = []

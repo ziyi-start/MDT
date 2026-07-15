@@ -296,19 +296,27 @@ class MedicalOrchestrator:
                 if decision is None:
                     decision = RouteDecision(route_path="simple_rag", departments=[])
 
+            # ---- 获取多轮对话历史（上下文穿透 + 摘要 + 最近对话） ----
+            history_context = ""
+            if self.context_manager:
+                history_context = self.context_manager.get_conversation_context()
+                if history_context:
+                    budget_warning = self.context_manager.check_budget_and_warn()
+                    if budget_warning:
+                        logger.warning(budget_warning)
+
             # ---- Step 4: 执行工作流 ----
             if not llm_available:
                 response = await self._retrieval_only_response(query, profile, decision)
                 self.event_memory.ingest("LLM不可用，纯检索模式", event_type=EventType.DECISION)
-                self._finalize_run(run_ctx, response)
+                self._finalize_run(run_ctx, response, context_manager=self.context_manager)
                 return response
 
             if decision.route_path == "simple_rag":
                 if trace:
                     trace.begin_span("execute_simple_rag")
-                # 事件记忆: Simple RAG 执行
                 self.event_memory.ingest("Simple RAG 检索开始", event_type=EventType.LITERATURE_SEARCH)
-                response, docs = await self._run_simple_rag(query, profile, skill_hints=skill_hints)
+                response, docs = await self._run_simple_rag(query, profile, skill_hints=skill_hints, history_context=history_context)
                 if trace:
                     trace.end_span(trace._stack[-1].span_id if trace._stack else "")
                 # 事件记忆: 检索结果
@@ -358,6 +366,7 @@ class MedicalOrchestrator:
                         departments=decision.departments or self._infer_departments(query.query),
                         escalation_reason=e.reason,
                         skill_hints=skill_hints,
+                        history_context=history_context,
                     )
                     await self._log_pipeline(timer, "mdt_escalated")
                     # ---- 上下文: 记录升级路径 ----
@@ -384,6 +393,7 @@ class MedicalOrchestrator:
                     query, profile,
                     departments=decision.departments,
                     skill_hints=skill_hints,
+                    history_context=history_context,
                 )
                 self.event_memory.ingest(
                     f"MDT 会诊完成: 信心={result.confidence}",
@@ -452,10 +462,10 @@ class MedicalOrchestrator:
         profile_summary = f"疾病:{profile.diseases} 用药:{profile.medications} 过敏:{profile.allergies}"
         return await self.llm_router.route(query, profile_summary)
 
-    async def _run_simple_rag(self, query: MedicalQuery, profile: PatientProfile, skill_hints: str = ""):
+    async def _run_simple_rag(self, query: MedicalQuery, profile: PatientProfile, skill_hints: str = "", history_context: str = ""):
         """执行简单 RAG"""
         workflow = SimpleRAGWorkflow(self.llm, self.retriever, self.reranker, self.reflection)
-        return await workflow.run(query, profile, skill_hints=skill_hints)
+        return await workflow.run(query, profile, skill_hints=skill_hints, history_context=history_context)
 
     async def _run_mdt(
         self,
@@ -464,12 +474,15 @@ class MedicalOrchestrator:
         departments: list[str],
         escalation_reason: str = "",
         skill_hints: str = "",
+        history_context: str = "",
     ):
         """执行 MDT 会诊（含共识引导检索）+ Decision Maker 评估"""
         workflow = MDTConsultationWorkflow(
             self.llm, self.reflection, self.retriever, self.reranker, profile
         )
-        response = await workflow.run(query, departments, escalation_reason, skill_hints=skill_hints)
+        response = await workflow.run(query, departments, escalation_reason, skill_hints=skill_hints, history_context=history_context)
+
+        # ---- Decision Maker 安全阀评估（基于证据验证后的共识） ----
 
         # ---- Decision Maker 安全阀评估（基于证据验证后的共识） ----
         try:
@@ -651,6 +664,11 @@ class MedicalOrchestrator:
             except Exception:
                 pass
 
+        # Conversation history
+        history_context = ""
+        if self.context_manager:
+            history_context = self.context_manager.get_conversation_context()
+
         # Route
         if llm_available:
             decision = await self._route_async(query.query, profile)
@@ -671,7 +689,7 @@ class MedicalOrchestrator:
 
             wf = SimpleRAGWorkflow(self.llm, self.retriever, self.reranker, self.reflection)
             full_text = ""
-            async for chunk in wf.run_stream(query, profile, skill_hints=skill_hints):
+            async for chunk in wf.run_stream(query, profile, skill_hints=skill_hints, history_context=history_context):
                 if chunk["type"] == "content":
                     full_text += chunk["text"]
                 elif chunk["type"] == "done":
@@ -706,7 +724,7 @@ class MedicalOrchestrator:
             full_text = ""
             async for chunk in wf.run_stream(
                 query, departments=decision.departments,
-                escalation_reason="", skill_hints=skill_hints,
+                escalation_reason="", skill_hints=skill_hints, history_context=history_context,
             ):
                 if chunk["type"] == "content":
                     full_text += chunk["text"]

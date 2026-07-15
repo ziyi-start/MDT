@@ -275,6 +275,8 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning(f"MCP 客户端初始化跳过: {e}")
     yield
+    if context_manager:
+        context_manager.end_session()
     logger.info("系统关闭")
 
 

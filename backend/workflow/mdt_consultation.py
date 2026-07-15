@@ -63,6 +63,7 @@ class MDTConsultationWorkflow:
         departments: list[str],
         escalation_reason: str = "",
         skill_hints: str = "",
+        history_context: str = "",
     ) -> MedicalResponse:
         """执行 MDT 会诊
 
@@ -96,6 +97,8 @@ class MDTConsultationWorkflow:
             )
             if skill_hints:
                 system_prompt += f"\n\n{skill_hints}"
+            if history_context:
+                system_prompt += f"\n\n--- 对话历史 ---\n{history_context}"
             # 注入患者画像到专家 System Prompt
             if self.profile:
                 system_prompt += (
@@ -219,6 +222,7 @@ class MDTConsultationWorkflow:
         departments: list[str],
         escalation_reason: str = "",
         skill_hints: str = "",
+        history_context: str = "",
     ) -> AsyncIterator[dict]:
         """流式执行 MDT 会诊 — 专家并发后，共识+验证逐 token 输出"""
         yield {"type": "status", "text": f"招募专家: {', '.join(departments)}"}
@@ -238,6 +242,8 @@ class MDTConsultationWorkflow:
             system_prompt = EXPERT_SYSTEM_PROMPT.format(department=dept, reflection_hint=reflection_hint)
             if skill_hints:
                 system_prompt += f"\n\n{skill_hints}"
+            if history_context:
+                system_prompt += f"\n\n--- 对话历史 ---\n{history_context}"
             if self.profile:
                 system_prompt += f"\n\n患者画像：疾病={self.profile.diseases}, 用药={self.profile.medications}, 过敏={self.profile.allergies}"
             if escalation_reason:

@@ -236,6 +236,20 @@ class ContextManager:
             departments=departments,
         )
 
+    def get_conversation_context(self) -> str:
+        """获取多轮对话上下文，用于注入 LLM prompt
+
+        包含: 穿透约束 + 老轮次摘要 + 最近对话
+        """
+        return self.conversation.get_history_context()
+
+    def check_budget_and_warn(self) -> str:
+        """检查预算状态，返回警告信息（超限时非空）"""
+        status = self.window.check()
+        if status in (BudgetStatus.CRITICAL, BudgetStatus.WARNING):
+            return f"上下文预算告警: {status.value} (usage={self.window.usage_ratio():.0%})"
+        return ""
+
     # ============================================================
     # 上下文组装
     # ============================================================

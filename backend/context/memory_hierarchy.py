@@ -168,6 +168,7 @@ class MemoryHierarchy:
         self._short_term.append(entry)
         self._evict_if_needed(MemoryTier.SHORT_TERM)
         self._maybe_summarize_short_term()
+        self._enforce_window_limit()
         return entry
 
     def add_long_term(self, content: str, role: MessageRole = MessageRole.MEMORY,
@@ -298,6 +299,14 @@ class MemoryHierarchy:
 
         self._short_term = self._short_term[mid:]
         logger.info(f"Short-term memory compressed: {len(old_entries)} entries -> summary ({len(summary)} chars)")
+
+    def _enforce_window_limit(self):
+        """强制执行消息条数上限: 超过 short_term_window_size 则丢弃最老的"""
+        limit = self.config.short_term_window_size
+        if len(self._short_term) > limit:
+            excess = len(self._short_term) - limit
+            self._short_term = self._short_term[excess:]
+            logger.debug(f"Short-term window enforced: dropped {excess} oldest entries (limit={limit})")
 
     def assemble_context(self, query: Optional[str] = None, max_tokens: int = 0) -> str:
         """组装完整上下文 — 四层拼接为 LLM 可消费的文本"""
